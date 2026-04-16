@@ -22,6 +22,7 @@ pub struct ClaudeSdkClient {
     options: Arc<Mutex<Option<ClaudeAgentOptions>>>,
     custom_transport: Option<Box<dyn Transport>>,
     query: Mutex<Option<Arc<Query>>>,
+    rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Result<Value>>>>>,
 }
 
 impl ClaudeSdkClient {
@@ -30,6 +31,7 @@ impl ClaudeSdkClient {
             options: Arc::new(Mutex::new(Some(options))),
             custom_transport: None,
             query: Mutex::new(None),
+            rx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -38,6 +40,7 @@ impl ClaudeSdkClient {
             options: Arc::new(Mutex::new(Some(options))),
             custom_transport: Some(transport),
             query: Mutex::new(None),
+            rx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -109,29 +112,45 @@ impl ClaudeSdkClient {
             None => {}
         }
 
+        // Take the receiver once and store it for repeated receive_messages calls.
+        let rx = q.take_receiver().await.ok_or_else(|| {
+            ClaudeSdkError::cli_connection("Failed to take message receiver from query")
+        })?;
+        *self.rx.lock().await = Some(rx);
         *self.query.lock().await = Some(q);
         Ok(())
     }
 
-    /// Receive all messages.
+    /// Receive all messages. Can be called multiple times — each call continues
+    /// where the previous one left off (like the Python SDK's `receive_messages()`).
     pub async fn receive_messages(&self) -> Result<BoxStream<'static, Result<Message>>> {
-        let q = self.require_query().await?;
-        let rx = q
-            .take_receiver()
-            .await
-            .ok_or_else(|| ClaudeSdkError::cli_connection("Receiver already taken"))?;
+        let _ = self.require_query().await?;
+        let rx_arc = self.rx.clone();
         let stream = async_stream::try_stream! {
-            let mut rx = rx;
-            while let Some(item) = rx.recv().await {
-                let v = item?;
-                if v.get("type").and_then(Value::as_str) == Some("end") { break; }
-                if v.get("type").and_then(Value::as_str) == Some("error") {
-                    let msg = v.get("error").and_then(Value::as_str).unwrap_or("Unknown error").to_string();
-                    Err(ClaudeSdkError::cli_connection(msg))?;
-                    unreachable!();
-                }
-                if let Some(msg) = parse_message(&v)? {
-                    yield msg;
+            loop {
+                let item = {
+                    let mut guard = rx_arc.lock().await;
+                    let rx = guard.as_mut();
+                    match rx {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                };
+                match item {
+                    None => break,
+                    Some(result) => {
+                        let v = result?;
+                        let msg_type = v.get("type").and_then(Value::as_str).unwrap_or("");
+                        if msg_type == "end" { break; }
+                        if msg_type == "error" {
+                            let msg = v.get("error").and_then(Value::as_str).unwrap_or("Unknown error").to_string();
+                            Err(ClaudeSdkError::cli_connection(msg))?;
+                            unreachable!();
+                        }
+                        if let Some(msg) = parse_message(&v)? {
+                            yield msg;
+                        }
+                    }
                 }
             }
         };
