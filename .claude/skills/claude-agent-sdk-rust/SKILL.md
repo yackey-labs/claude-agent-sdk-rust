@@ -429,6 +429,57 @@ let usage = chat.context_usage().await?;
 
 // Stop a background task
 chat.stop_task("task-id").await?;
+
+// Get server initialization info
+let info = chat.server_info().await?;
+
+// Reconnect a failed MCP server
+chat.reconnect_mcp_server("my-server").await?;
+
+// Toggle an MCP server on/off
+chat.toggle_mcp_server("my-server", false).await?;
+
+// Rewind files to a checkpoint (requires enable_file_checkpointing)
+chat.rewind_files("user-message-uuid").await?;
+```
+
+---
+
+## Image uploads (streaming mode)
+
+Image uploads require the low-level streaming API. Construct a message with
+base64-encoded image content:
+
+```rust
+use claude_agent_sdk::{query_with_transport, ClaudeAgentOptions, Prompt};
+use serde_json::json;
+use futures::stream;
+
+let image_data = base64::encode(std::fs::read("diagram.png")?);
+let messages = stream::iter(vec![
+    json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this diagram"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_data
+                    }
+                }
+            ]
+        }
+    })
+]);
+let stream = query_with_transport(
+    Prompt::Stream(Box::pin(messages)),
+    ClaudeAgentOptions::default(),
+    None,
+).await?;
 ```
 
 ---
@@ -487,6 +538,15 @@ All builder methods (chainable):
 | `.resume(id)` | Resume previous session |
 | `.continue_conversation()` | Continue most recent session |
 | `.cli_path(path)` | Path to `claude` binary |
+| `.add_dir(path)` | Additional working directory |
+| `.settings(json_or_path)` | Settings file or inline JSON |
+| `.setting_sources(vec)` | Which setting sources to load (user/project/local) |
+| `.beta("context-1m-2025-08-07")` | Add a beta feature flag |
+| `.plugin_dir(path)` | Add a local plugin directory |
+| `.user("name")` | Set user field for attribution |
+| `.fork_session()` | Fork on resume instead of continuing |
+| `.include_partial_messages()` | Enable partial streaming events |
+| `.task_budget(tokens)` | API-side task budget in tokens |
 | `.env(key, value)` | Set environment variable |
 | `.output_format(schema)` | Request structured JSON output |
 | `.enable_file_checkpointing()` | Enable file rewind |

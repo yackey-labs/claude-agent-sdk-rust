@@ -287,6 +287,26 @@ impl Chat {
         self.client.stop_task(task_id).await
     }
 
+    /// Get server initialization info (available commands, output styles).
+    pub async fn server_info(&self) -> Result<Option<Value>> {
+        self.client.get_server_info().await
+    }
+
+    /// Reconnect a failed MCP server.
+    pub async fn reconnect_mcp_server(&self, name: &str) -> Result<()> {
+        self.client.reconnect_mcp_server(name).await
+    }
+
+    /// Enable or disable an MCP server.
+    pub async fn toggle_mcp_server(&self, name: &str, enabled: bool) -> Result<()> {
+        self.client.toggle_mcp_server(name, enabled).await
+    }
+
+    /// Rewind tracked files to a specific user message checkpoint.
+    pub async fn rewind_files(&self, user_message_id: &str) -> Result<()> {
+        self.client.rewind_files(user_message_id).await
+    }
+
     /// Disconnect the session.
     pub async fn disconnect(&mut self) -> Result<()> {
         if self.connected {
@@ -537,6 +557,57 @@ impl ClaudeBuilder {
     /// Enable file checkpointing (for `rewind_files`).
     pub fn enable_file_checkpointing(mut self) -> Self {
         self.options.enable_file_checkpointing = true;
+        self
+    }
+
+    // ---- Session features ----
+
+    /// Fork resumed sessions to a new session ID instead of continuing the original.
+    pub fn fork_session(mut self) -> Self {
+        self.options.fork_session = true;
+        self
+    }
+    /// Enable partial (streaming) message events.
+    pub fn include_partial_messages(mut self) -> Self {
+        self.options.include_partial_messages = true;
+        self
+    }
+    /// Set the API-side task budget in tokens.
+    pub fn task_budget(mut self, total_tokens: u64) -> Self {
+        self.options.task_budget = Some(TaskBudget { total: total_tokens });
+        self
+    }
+
+    // ---- Settings / plugins / betas ----
+
+    /// Set which setting sources to load (`user`, `project`, `local`).
+    pub fn setting_sources(mut self, sources: Vec<SettingSource>) -> Self {
+        self.options.setting_sources = Some(sources);
+        self
+    }
+    /// Add a beta feature flag.
+    pub fn beta(mut self, beta: impl Into<String>) -> Self {
+        self.options.betas.push(beta.into());
+        self
+    }
+    /// Add a local plugin directory.
+    pub fn plugin_dir(mut self, path: impl Into<String>) -> Self {
+        self.options.plugins.push(SdkPluginConfig::Local { path: path.into() });
+        self
+    }
+    /// Set the `user` field (passed to the CLI for attribution).
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.options.user = Some(user.into());
+        self
+    }
+    /// Add additional working directories.
+    pub fn add_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.options.add_dirs.push(path.into());
+        self
+    }
+    /// Settings file path or inline JSON string.
+    pub fn settings(mut self, settings: impl Into<String>) -> Self {
+        self.options.settings = Some(settings.into());
         self
     }
 
