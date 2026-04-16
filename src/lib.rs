@@ -36,6 +36,7 @@
 pub mod client;
 pub mod convenience;
 pub mod errors;
+pub mod helpers;
 pub mod mcp;
 pub mod message_parser;
 pub mod query;
@@ -57,6 +58,7 @@ pub use session_mutations::{delete_session, fork_session, rename_session, tag_se
 pub use transport::Transport;
 pub use types::*;
 pub use convenience::{Chat, Claude, ClaudeBuilder, Reply, Turn};
+pub use helpers::{allow_all, deny_tool, hook_all, hook_fn, hook_tools, permission_fn};
 
 /// One-shot query — fire a prompt at Claude Code and stream messages back.
 ///

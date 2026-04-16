@@ -54,5 +54,11 @@ name = "builder"
 name = "streaming_text"
 
 [[example]]
+name = "hooks"
+
+[[example]]
+name = "permissions"
+
+[[example]]
 name = "mcp_calculator"
 required-features = ["mcp"]

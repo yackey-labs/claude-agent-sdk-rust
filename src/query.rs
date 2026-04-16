@@ -41,6 +41,8 @@ pub struct Query {
     closed: Arc<std::sync::atomic::AtomicBool>,
     read_handle: Mutex<Option<JoinHandle<()>>>,
     child_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Inflight control request handlers, keyed by request_id for cancellation.
+    inflight_requests: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     initialization_result: Arc<Mutex<Option<Value>>>,
 }
 
@@ -75,6 +77,7 @@ impl Query {
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             read_handle: Mutex::new(None),
             child_handles: Mutex::new(Vec::new()),
+            inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             initialization_result: Arc::new(Mutex::new(None)),
         }
     }
@@ -115,16 +118,23 @@ impl Query {
                             }
                         }
                         "control_request" => {
+                            let req_id = msg.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
                             let me = self.clone();
                             let req = msg.clone();
+                            let inflight = self.inflight_requests.clone();
+                            let rid = req_id.clone();
                             let h = tokio::spawn(async move {
                                 me.handle_control_request(req).await;
+                                inflight.lock().await.remove(&rid);
                             });
-                            self.child_handles.lock().await.push(h);
+                            self.inflight_requests.lock().await.insert(req_id, h);
                         }
                         "control_cancel_request" => {
-                            // We don't currently track per-request handles for cancellation.
-                            debug!("control_cancel_request received (cancellation not supported in Rust port)");
+                            let cancel_id = msg.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
+                            if let Some(handle) = self.inflight_requests.lock().await.remove(&cancel_id) {
+                                handle.abort();
+                                debug!("Cancelled inflight request: {cancel_id}");
+                            }
                         }
                         _ => {
                             if msg_type == "result" {
@@ -442,6 +452,9 @@ impl Query {
             handle.abort();
         }
         for h in self.child_handles.lock().await.drain(..) {
+            h.abort();
+        }
+        for (_, h) in self.inflight_requests.lock().await.drain() {
             h.abort();
         }
         let mut t = self.transport.lock().await;
