@@ -683,17 +683,57 @@ println!("Cost: ${:.2}", analysis.cost_usd + plan.cost_usd + fix.cost_usd);
 
 ### Error handling
 
+Two distinct failure surfaces — handle both. Never assume the happy path.
+
+**1. Agent-level errors** (CLI ran fine, but Claude returned an error turn):
+
 ```rust
 let reply = Claude::ask("do something").await?;
 if reply.is_error {
     eprintln!("Claude error: {:?}", reply.errors);
 }
-if !reply.errors.is_empty() {
-    for err in &reply.errors {
-        eprintln!("  {err}");
-    }
+for err in &reply.errors {
+    eprintln!("  {err}");
 }
 ```
+
+**2. CLI-level errors** (subprocess crashed, auth failed, CLI spawned a tool it
+couldn't run, etc.). These surface as `Err(ClaudeSdkError::Process | CliConnection | ...)`
+from `.ask()?`. The `ProcessError.stderr` field is hardcoded to
+`"Check stderr output for details"` — it does **not** contain the real stderr.
+If you want diagnostics, you **must** register a `.stderr(...)` callback:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+let sink = Arc::clone(&captured);
+
+let result = Claude::builder()
+    .stderr(Arc::new(move |line| {
+        eprintln!("[claude stderr] {line}");
+        sink.lock().unwrap().push(line.to_string());
+    }))
+    .ask("run `git status`")
+    .await;
+
+if let Err(e) = result {
+    let lines = captured.lock().unwrap();
+    eprintln!("CLI failed: {e}");
+    eprintln!("Last stderr lines:\n{}", lines.join("\n"));
+}
+```
+
+**Why this matters**: the CLI writes tool-permission denials, model errors,
+network failures, and sandbox violations to stderr — not to the result JSON.
+Example: the agent decides to call `Bash` but your `.allowed_tools(["Read"])`
+blocks it; the CLI logs the denial on stderr while the `reply.errors` list
+stays empty or vague. Without a stderr callback you have no idea what went
+wrong. Always wire one up in production code (a bounded `VecDeque` of the
+last 100 lines is a common pattern so memory doesn't grow unbounded).
+
+For local development, `.extra_arg("debug-to-stderr", None)` makes the CLI
+verbose on stderr — combine with a callback to tail it.
 
 ---
 
