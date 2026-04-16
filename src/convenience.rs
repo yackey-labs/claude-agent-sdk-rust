@@ -595,6 +595,11 @@ impl ClaudeBuilder {
         self.options.plugins.push(SdkPluginConfig::Local { path: path.into() });
         self
     }
+    /// Authenticate with a Claude Code OAuth token.
+    /// Sets `CLAUDE_CODE_OAUTH_TOKEN` on the CLI subprocess.
+    pub fn oauth_token(self, token: impl Into<String>) -> Self {
+        self.env("CLAUDE_CODE_OAUTH_TOKEN", token)
+    }
     /// Set the `user` field (passed to the CLI for attribution).
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.options.user = Some(user.into());

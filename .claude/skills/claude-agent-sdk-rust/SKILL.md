@@ -548,6 +548,7 @@ All builder methods (chainable):
 | `.include_partial_messages()` | Enable partial streaming events |
 | `.task_budget(tokens)` | API-side task budget in tokens |
 | `.telemetry(config)` | Configure OTel export (see below) |
+| `.oauth_token(token)` | Authenticate with a Claude Code OAuth token |
 | `.env(key, value)` | Set environment variable |
 | `.output_format(schema)` | Request structured JSON output |
 | `.enable_file_checkpointing()` | Enable file rewind |
