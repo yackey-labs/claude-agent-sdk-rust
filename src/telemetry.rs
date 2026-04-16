@@ -249,10 +249,4 @@ impl Telemetry {
             .export_interval_ms(1000)
     }
 
-    /// Preconfigured for Steve's homelab OTel collector.
-    pub fn yackey_cloud(service_name: impl Into<String>) -> Self {
-        Self::new("https://otel-local.yackey.cloud")
-            .service_name(service_name)
-            .all()
-    }
 }
