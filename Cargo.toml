@@ -1,0 +1,51 @@
+[package]
+name = "claude-agent-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust SDK for Claude Code (Claude Agent SDK)"
+license = "MIT"
+repository = "https://github.com/yackey-labs/claude-agent-sdk-rust"
+homepage = "https://github.com/yackey-labs/claude-agent-sdk-rust"
+documentation = "https://docs.rs/claude-agent-sdk"
+keywords = ["claude", "anthropic", "ai", "sdk", "agent"]
+categories = ["api-bindings", "command-line-utilities"]
+readme = "README.md"
+
+[features]
+default = ["mcp"]
+# Enable in-process MCP SDK server support (`tool!` / `create_sdk_mcp_server`).
+mcp = []
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+which = "6"
+tracing = "0.1"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
+rand = "0.8"
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util", "macros"] }
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[[example]]
+name = "quickstart"
+
+[[example]]
+name = "streaming_client"
+
+[[example]]
+name = "mcp_calculator"
+required-features = ["mcp"]
