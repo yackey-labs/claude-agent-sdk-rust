@@ -547,6 +547,7 @@ All builder methods (chainable):
 | `.fork_session()` | Fork on resume instead of continuing |
 | `.include_partial_messages()` | Enable partial streaming events |
 | `.task_budget(tokens)` | API-side task budget in tokens |
+| `.telemetry(config)` | Configure OTel export (see below) |
 | `.env(key, value)` | Set environment variable |
 | `.output_format(schema)` | Request structured JSON output |
 | `.enable_file_checkpointing()` | Enable file rewind |
@@ -557,6 +558,92 @@ All builder methods (chainable):
 | `.ask(prompt)` | Terminal: one-shot query |
 | `.ask_streaming(prompt, callback)` | Terminal: streaming one-shot |
 | `.chat()` | Terminal: start multi-turn session |
+
+---
+
+## Observability (OpenTelemetry)
+
+The Claude Code CLI has built-in OTel instrumentation. The SDK provides a
+`Telemetry` builder that configures the right env vars — you don't need to
+set them manually.
+
+### Quick setup
+
+```rust
+use claude_agent_sdk::{Claude, Telemetry};
+
+// Honeycomb — one-liner
+let reply = Claude::builder()
+    .telemetry(Telemetry::honeycomb("your-api-key", "my-agent"))
+    .ask("What files are here?")
+    .await?;
+
+// Local collector (dev)
+let reply = Claude::builder()
+    .telemetry(Telemetry::local("my-agent"))
+    .ask("What files are here?")
+    .await?;
+```
+
+### Custom configuration
+
+```rust
+let otel = Telemetry::new("https://otel-collector.example.com:4318")
+    .service_name("my-agent")
+    .header("Authorization", "Bearer token")
+    .resource_attr("service.version", "1.0.0")
+    .resource_attr("deployment.environment", "production")
+    .traces()       // spans for agent loop, model calls, tool calls
+    .metrics()      // token counters, cost, session counts
+    .logs()         // structured events for prompts and tool results
+    .log_tool_details()   // include tool input args
+    .export_interval_ms(1000);  // flush every 1s
+
+Claude::builder().telemetry(otel).ask("...").await?;
+```
+
+### What gets traced
+
+| Span | Description |
+|---|---|
+| `claude_code.interaction` | One turn of the agent loop (prompt → response) |
+| `claude_code.llm_request` | Each Claude API call (model, latency, tokens) |
+| `claude_code.tool` | Each tool invocation |
+| `claude_code.tool.blocked_on_user` | Time waiting for permission approval |
+| `claude_code.tool.execution` | Tool execution time |
+| `claude_code.hook` | Each hook execution |
+
+All spans carry `session.id` for cross-query correlation.
+
+### Telemetry builder methods
+
+| Method | Description |
+|---|---|
+| `Telemetry::new(endpoint)` | Custom OTLP endpoint |
+| `Telemetry::honeycomb(key, name)` | Preconfigured for Honeycomb |
+| `Telemetry::local(name)` | Preconfigured for localhost:4318 |
+| `.service_name(name)` | Override `service.name` (default: `claude-code`) |
+| `.header(key, value)` | Add OTLP header (e.g. auth) |
+| `.resource_attr(key, value)` | Add OTel resource attribute |
+| `.traces()` | Enable trace spans (beta) |
+| `.metrics()` | Enable metrics (tokens, cost) |
+| `.logs()` | Enable log events (prompts, results) |
+| `.all()` | Enable traces + metrics + logs |
+| `.log_user_prompts()` | Include prompt text in telemetry |
+| `.log_tool_details()` | Include tool input args |
+| `.log_tool_content()` | Include full tool I/O (60KB max) |
+| `.export_interval_ms(ms)` | Set flush interval for all signals |
+
+### Sensitive data
+
+By default, only structural data (token counts, durations, tool names) is
+exported. Content requires explicit opt-in:
+
+- `.log_user_prompts()` — prompt text
+- `.log_tool_details()` — tool input args (file paths, commands)
+- `.log_tool_content()` — full tool input/output bodies (requires `.traces()`)
+
+Only enable these if your backend is approved for the data your agent handles.
 
 ---
 

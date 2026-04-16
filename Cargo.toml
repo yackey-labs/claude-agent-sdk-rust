@@ -54,6 +54,9 @@ name = "builder"
 name = "streaming_text"
 
 [[example]]
+name = "telemetry"
+
+[[example]]
 name = "hooks"
 
 [[example]]

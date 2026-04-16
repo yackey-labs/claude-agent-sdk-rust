@@ -42,6 +42,7 @@ pub mod message_parser;
 pub mod query;
 pub mod sessions;
 pub mod session_mutations;
+pub mod telemetry;
 pub mod transport;
 pub mod types;
 
@@ -59,6 +60,7 @@ pub use transport::Transport;
 pub use types::*;
 pub use convenience::{Chat, Claude, ClaudeBuilder, Reply, Turn};
 pub use helpers::{allow_all, deny_tool, hook_all, hook_fn, hook_tools, permission_fn};
+pub use telemetry::Telemetry;
 
 /// One-shot query — fire a prompt at Claude Code and stream messages back.
 ///

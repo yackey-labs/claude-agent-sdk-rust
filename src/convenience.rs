@@ -611,6 +611,28 @@ impl ClaudeBuilder {
         self
     }
 
+    // ---- Telemetry ----
+
+    /// Configure OpenTelemetry export for this agent. Sets the necessary
+    /// environment variables on the CLI process.
+    ///
+    /// ```no_run
+    /// # async fn run() -> claude_agent_sdk::Result<()> {
+    /// use claude_agent_sdk::{Claude, Telemetry};
+    ///
+    /// let reply = Claude::builder()
+    ///     .telemetry(Telemetry::honeycomb("your-api-key", "my-agent"))
+    ///     .ask("What files are here?")
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn telemetry(mut self, config: crate::telemetry::Telemetry) -> Self {
+        for (k, v) in config.to_env() {
+            self.options.env.insert(k, v);
+        }
+        self
+    }
+
     // ---- Sandbox ----
 
     pub fn sandbox(mut self, settings: Value) -> Self {
