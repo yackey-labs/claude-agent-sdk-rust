@@ -592,6 +592,37 @@ pub enum ContentBlock {
     ToolResult(ToolResultBlock),
 }
 
+impl ContentBlock {
+    /// Extract the text if this is a [`ContentBlock::Text`].
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(t) => Some(&t.text),
+            _ => None,
+        }
+    }
+    /// Extract the thinking text if this is a [`ContentBlock::Thinking`].
+    pub fn as_thinking(&self) -> Option<&str> {
+        match self {
+            Self::Thinking(t) => Some(&t.thinking),
+            _ => None,
+        }
+    }
+    /// Extract the tool use if this is a [`ContentBlock::ToolUse`].
+    pub fn as_tool_use(&self) -> Option<&ToolUseBlock> {
+        match self {
+            Self::ToolUse(t) => Some(t),
+            _ => None,
+        }
+    }
+    /// Extract the tool result if this is a [`ContentBlock::ToolResult`].
+    pub fn as_tool_result(&self) -> Option<&ToolResultBlock> {
+        match self {
+            Self::ToolResult(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -633,6 +664,50 @@ pub struct AssistantMessage {
     pub stop_reason: Option<String>,
     pub session_id: Option<String>,
     pub uuid: Option<String>,
+}
+
+impl AssistantMessage {
+    /// Concatenate all text blocks into a single string.
+    pub fn text(&self) -> String {
+        self.content.iter().filter_map(|b| b.as_text()).collect::<Vec<_>>().join("")
+    }
+    /// All tool-use blocks in the response.
+    pub fn tool_uses(&self) -> Vec<&ToolUseBlock> {
+        self.content.iter().filter_map(|b| b.as_tool_use()).collect()
+    }
+    /// Concatenate all thinking blocks.
+    pub fn thinking(&self) -> String {
+        self.content.iter().filter_map(|b| b.as_thinking()).collect::<Vec<_>>().join("")
+    }
+}
+
+impl Message {
+    /// Extract the text from this message if it's an assistant message with text content.
+    pub fn text(&self) -> Option<String> {
+        match self {
+            Self::Assistant(a) => {
+                let t = a.text();
+                if t.is_empty() { None } else { Some(t) }
+            }
+            _ => None,
+        }
+    }
+    /// Downcast to [`AssistantMessage`].
+    pub fn as_assistant(&self) -> Option<&AssistantMessage> {
+        match self { Self::Assistant(a) => Some(a), _ => None }
+    }
+    /// Downcast to [`ResultMessage`].
+    pub fn as_result(&self) -> Option<&ResultMessage> {
+        match self { Self::Result(r) => Some(r), _ => None }
+    }
+    /// Downcast to [`SystemMessage`].
+    pub fn as_system(&self) -> Option<&SystemMessage> {
+        match self { Self::System(s) => Some(s), _ => None }
+    }
+    /// Downcast to [`UserMessage`].
+    pub fn as_user(&self) -> Option<&UserMessage> {
+        match self { Self::User(u) => Some(u), _ => None }
+    }
 }
 
 #[derive(Debug, Clone)]

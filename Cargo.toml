@@ -48,5 +48,11 @@ name = "quickstart"
 name = "streaming_client"
 
 [[example]]
+name = "builder"
+
+[[example]]
+name = "streaming_text"
+
+[[example]]
 name = "mcp_calculator"
 required-features = ["mcp"]

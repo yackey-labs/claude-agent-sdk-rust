@@ -34,6 +34,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod client;
+pub mod convenience;
 pub mod errors;
 pub mod mcp;
 pub mod message_parser;
@@ -55,6 +56,7 @@ pub use sessions::{get_session_info, get_session_messages, list_sessions};
 pub use session_mutations::{delete_session, fork_session, rename_session, tag_session, ForkSessionResult};
 pub use transport::Transport;
 pub use types::*;
+pub use convenience::{Chat, Claude, ClaudeBuilder, Reply, Turn};
 
 /// One-shot query — fire a prompt at Claude Code and stream messages back.
 ///

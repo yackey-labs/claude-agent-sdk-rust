@@ -1,31 +1,11 @@
-//! Minimal one-shot query — prints assistant text blocks as they arrive.
+//! Minimal one-shot query — the simplest possible usage.
 
-use claude_agent_sdk::{query, ClaudeAgentOptions, ContentBlock, Message};
-use futures::StreamExt;
+use claude_agent_sdk::Claude;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
-    let mut stream = query("What is 2 + 2?", ClaudeAgentOptions::default()).await?;
-    while let Some(item) = stream.next().await {
-        match item? {
-            Message::Assistant(a) => {
-                for block in &a.content {
-                    if let ContentBlock::Text(t) = block {
-                        println!("{}", t.text);
-                    }
-                }
-            }
-            Message::Result(r) => {
-                println!("\n--- done in {}ms (cost ${:.4}) ---",
-                    r.duration_ms,
-                    r.total_cost_usd.unwrap_or(0.0));
-            }
-            _ => {}
-        }
-    }
+    let reply = Claude::ask("What is 2 + 2? Reply with just the number.").await?;
+    println!("{}", reply.text);
+    println!("--- done in {}ms (cost ${:.4}) ---", reply.duration_ms, reply.cost_usd);
     Ok(())
 }

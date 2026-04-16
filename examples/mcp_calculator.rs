@@ -1,18 +1,10 @@
 //! In-process MCP server providing `add` and `multiply` tools.
 
-use std::collections::HashMap;
-
-use claude_agent_sdk::{
-    create_sdk_mcp_server, query, tool, ClaudeAgentOptions, ContentBlock, McpServerConfig,
-    McpServers, Message,
-};
-use futures::StreamExt;
+use claude_agent_sdk::{create_sdk_mcp_server, tool, Claude};
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let add = tool!(
         "add",
         "Add two numbers",
@@ -44,27 +36,13 @@ async fn main() -> anyhow::Result<()> {
 
     let server = create_sdk_mcp_server("calculator", "1.0.0", vec![add, multiply]);
 
-    let mut servers: HashMap<String, McpServerConfig> = HashMap::new();
-    servers.insert(
-        "calc".into(),
-        McpServerConfig::Sdk { name: "calculator".into(), server },
-    );
+    let reply = Claude::builder()
+        .add_sdk_mcp_server("calc", server)
+        .allowed_tools(["mcp__calc__add", "mcp__calc__multiply"])
+        .ask("Use the calculator to compute (3 + 4) * 5")
+        .await?;
 
-    let options = ClaudeAgentOptions {
-        mcp_servers: McpServers::Map(servers),
-        allowed_tools: vec!["mcp__calc__add".into(), "mcp__calc__multiply".into()],
-        ..Default::default()
-    };
-
-    let mut stream = query("Use the calculator to compute (3 + 4) * 5", options).await?;
-    while let Some(item) = stream.next().await {
-        if let Message::Assistant(a) = item? {
-            for b in &a.content {
-                if let ContentBlock::Text(t) = b {
-                    println!("{}", t.text);
-                }
-            }
-        }
-    }
+    println!("{}", reply.text);
+    println!("Tools used: {:?}", reply.tool_uses.iter().map(|t| &t.name).collect::<Vec<_>>());
     Ok(())
 }
