@@ -330,7 +330,7 @@ impl Query {
         }
         let counter = self.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut hex = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut hex);
+        rand::rng().fill_bytes(&mut hex);
         let request_id = format!("req_{counter}_{}", hex_encode(&hex));
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id.clone(), tx);
