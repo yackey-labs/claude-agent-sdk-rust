@@ -1,4 +1,4 @@
-# claude-agent-sdk
+# claude-agent-sdk-rust
 
 [![Crates.io](https://img.shields.io/crates/v/claude-agent-sdk.svg)](https://crates.io/crates/claude-agent-sdk)
 [![docs.rs](https://docs.rs/claude-agent-sdk/badge.svg)](https://docs.rs/claude-agent-sdk)
