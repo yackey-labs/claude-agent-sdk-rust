@@ -74,6 +74,14 @@ pub enum ClaudeSdkError {
     #[error("File not found: {0}")]
     FileNotFound(String),
 
+    /// A `SessionStore` adapter omitted an optional method.
+    #[error("SessionStore method not implemented: {0}")]
+    NotImplemented(&'static str),
+
+    /// A `SessionStore` adapter operation timed out.
+    #[error("SessionStore operation timed out: {0}")]
+    SessionStoreTimeout(String),
+
     /// Generic catch-all wrapping any other error.
     #[error("{0}")]
     Other(String),

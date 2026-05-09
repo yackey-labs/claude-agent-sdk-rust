@@ -42,6 +42,7 @@ pub mod message_parser;
 pub mod query;
 pub mod sessions;
 pub mod session_mutations;
+pub mod session_store_ops;
 pub mod telemetry;
 pub mod transport;
 pub mod types;
@@ -54,8 +55,22 @@ use serde_json::Value;
 pub use client::ClaudeSdkClient;
 pub use errors::{ClaudeSdkError, Result};
 pub use mcp::{create_sdk_mcp_server, McpToolAnnotations, SdkMcpServer, SdkMcpTool};
-pub use sessions::{get_session_info, get_session_messages, list_sessions};
-pub use session_mutations::{delete_session, fork_session, rename_session, tag_session, ForkSessionResult};
+pub use sessions::{
+    get_session_info, get_session_info_from_store, get_session_messages,
+    get_session_messages_from_store, get_subagent_messages,
+    get_subagent_messages_from_store, list_sessions, list_subagents,
+    list_subagents_from_store, project_key_for_directory,
+};
+pub use session_mutations::{
+    delete_session, delete_session_via_store, fork_session, fork_session_via_store,
+    rename_session, rename_session_via_store, tag_session, tag_session_via_store,
+    ForkSessionResult,
+};
+pub use session_store_ops::{
+    file_path_to_session_key, fold_session_summary, import_session_to_store,
+    summary_entry_to_sdk_info, validate_session_store_options, InMemorySessionStore,
+    OnMirrorError, TranscriptMirrorBatcher, MAX_PENDING_BYTES, MAX_PENDING_ENTRIES,
+};
 pub use transport::Transport;
 pub use types::*;
 pub use convenience::{Chat, Claude, ClaudeBuilder, Reply, Turn};
@@ -94,11 +109,15 @@ pub async fn query_with_transport(
         options.permission_prompt_tool_name = Some("stdio".into());
     }
 
+    session_store_ops::validate_session_store_options(&options)?;
+
     let can_use_tool = options.can_use_tool.clone();
     let hooks = options.hooks.take();
     let agents = options.agents.clone();
     let sdk_mcp_servers = client::extract_sdk_mcp_servers(&options.mcp_servers);
     let exclude_dynamic_sections = client::preset_exclude_dynamic(&options.system_prompt);
+    let skills = options.skills.clone();
+    let session_store = options.session_store.clone();
 
     let transport: Box<dyn Transport> = match transport {
         Some(t) => t,
@@ -109,7 +128,7 @@ pub async fn query_with_transport(
     let mut transport = transport;
     transport.connect().await?;
 
-    let q = Arc::new(query::Query::new(
+    let mut query_inner = query::Query::new(
         transport,
         true,
         can_use_tool,
@@ -118,7 +137,50 @@ pub async fn query_with_transport(
         initialize_timeout,
         agents,
         exclude_dynamic_sections,
-    ));
+    );
+    query_inner.set_skills(skills);
+    let q = Arc::new(query_inner);
+
+    if let Some(store) = session_store {
+        let projects_dir = sessions::projects_dir().to_string_lossy().to_string();
+        let q_for_err = Arc::downgrade(&q);
+        let on_error: session_store_ops::OnMirrorError = Arc::new(
+            move |key: Option<types::SessionKey>, err: String| {
+                let q_weak = q_for_err.clone();
+                Box::pin(async move {
+                    if let Some(q) = q_weak.upgrade() {
+                        let session_id = key
+                            .as_ref()
+                            .map(|k| k.session_id.clone())
+                            .unwrap_or_default();
+                        let mut msg = serde_json::Map::new();
+                        msg.insert("type".into(), Value::String("system".into()));
+                        msg.insert("subtype".into(), Value::String("mirror_error".into()));
+                        msg.insert("error".into(), Value::String(err));
+                        if let Some(k) = key {
+                            msg.insert(
+                                "key".into(),
+                                serde_json::to_value(&k).unwrap_or(Value::Null),
+                            );
+                        }
+                        msg.insert(
+                            "uuid".into(),
+                            Value::String(uuid::Uuid::new_v4().to_string()),
+                        );
+                        msg.insert("session_id".into(), Value::String(session_id));
+                        q.inject_message(Value::Object(msg)).await;
+                    }
+                }) as futures::future::BoxFuture<'static, ()>
+            },
+        );
+        let batcher = Arc::new(session_store_ops::TranscriptMirrorBatcher::new(
+            store,
+            projects_dir,
+            on_error,
+        ));
+        q.set_transcript_mirror_batcher(batcher).await;
+    }
+
     q.start().await?;
     q.initialize().await?;
 

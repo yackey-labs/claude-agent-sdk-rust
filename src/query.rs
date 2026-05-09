@@ -29,6 +29,11 @@ pub struct Query {
     initialize_timeout: Duration,
     agents: Option<HashMap<String, AgentDefinition>>,
     exclude_dynamic_sections: Option<bool>,
+    /// Optional skills allowlist forwarded via `initialize`. `None` means
+    /// "don't send the field"; `Some(SkillsConfig::All)` is also a no-op at
+    /// the wire level (omitted) since `"all"` and absent are equivalent —
+    /// only `Some(SkillsConfig::Only(_))` actually serializes.
+    skills: Option<SkillsConfig>,
 
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>,
     hook_callbacks: Arc<Mutex<HashMap<String, HookCallback>>>,
@@ -44,6 +49,13 @@ pub struct Query {
     /// Inflight control request handlers, keyed by request_id for cancellation.
     inflight_requests: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     initialization_result: Arc<Mutex<Option<Value>>>,
+    /// Transcript-mirror batcher attached via [`Query::set_transcript_mirror_batcher`].
+    transcript_mirror_batcher: Mutex<Option<Arc<crate::session_store_ops::TranscriptMirrorBatcher>>>,
+    /// Set to the result's error text when the most recent message is a
+    /// result with `is_error=true`. Used to replace the generic
+    /// "exit code 1" ProcessError with the structured error the CLI
+    /// already reported.
+    last_error_result_text: Arc<Mutex<Option<String>>>,
 }
 
 impl Query {
@@ -67,6 +79,7 @@ impl Query {
             initialize_timeout,
             agents,
             exclude_dynamic_sections,
+            skills: None,
             pending: Arc::new(Mutex::new(HashMap::new())),
             hook_callbacks: Arc::new(Mutex::new(HashMap::new())),
             next_callback_id: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -79,7 +92,27 @@ impl Query {
             child_handles: Mutex::new(Vec::new()),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             initialization_result: Arc::new(Mutex::new(None)),
+            transcript_mirror_batcher: Mutex::new(None),
+            last_error_result_text: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Forward a `skills` allowlist via the initialize control request so the
+    /// CLI filters which skills load into the system prompt. `Some(All)` is
+    /// equivalent to `None` at the wire level — only `Only(_)` is forwarded.
+    pub fn set_skills(&mut self, skills: Option<SkillsConfig>) {
+        self.skills = skills;
+    }
+
+    /// Attach a transcript-mirror batcher. When set, the read loop peels
+    /// `transcript_mirror` frames off stdout (they are not yielded to
+    /// consumers), enqueues them on the batcher, and flushes before yielding
+    /// each `result` message.
+    pub async fn set_transcript_mirror_batcher(
+        &self,
+        batcher: Arc<crate::session_store_ops::TranscriptMirrorBatcher>,
+    ) {
+        *self.transcript_mirror_batcher.lock().await = Some(batcher);
     }
 
     /// Start the background reader. Must be called once.
@@ -136,25 +169,104 @@ impl Query {
                                 debug!("Cancelled inflight request: {cancel_id}");
                             }
                         }
+                        "transcript_mirror" => {
+                            // SessionStore write path: peel mirror frames off
+                            // stdout and hand to the batcher; do NOT yield to
+                            // consumers.
+                            let batcher = self.transcript_mirror_batcher.lock().await.clone();
+                            if let Some(b) = batcher {
+                                let file_path = msg
+                                    .get("filePath")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                let entries = msg
+                                    .get("entries")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                b.enqueue(file_path, entries).await;
+                            }
+                        }
                         _ => {
                             if msg_type == "result" {
+                                // Flush pending transcript_mirror entries
+                                // before yielding so consumers observing the
+                                // result see an up-to-date SessionStore.
+                                let batcher =
+                                    self.transcript_mirror_batcher.lock().await.clone();
+                                if let Some(b) = batcher {
+                                    b.flush().await;
+                                }
                                 self.first_result.notify_waiters();
+                                if msg.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                                    let errors_str = msg
+                                        .get("errors")
+                                        .and_then(Value::as_array)
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join("; ")
+                                        });
+                                    let text = errors_str.unwrap_or_else(|| {
+                                        msg.get("subtype")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("unknown error")
+                                            .to_string()
+                                    });
+                                    *self.last_error_result_text.lock().await = Some(text);
+                                } else {
+                                    *self.last_error_result_text.lock().await = None;
+                                }
+                            } else if !(msg_type == "system"
+                                && msg.get("subtype").and_then(Value::as_str)
+                                    == Some("session_state_changed"))
+                            {
+                                // Anything other than the post-turn marker
+                                // means the conversation moved on; clear the
+                                // suppression text so a fresh crash reports
+                                // properly.
+                                *self.last_error_result_text.lock().await = None;
                             }
                             let _ = self.msg_tx.send(Ok(msg));
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Fatal reader error: {e}");
+                    // Replace ProcessError with the CLI's structured error
+                    // when one was just reported via a result message.
+                    let last_err = self.last_error_result_text.lock().await.clone();
+                    let err_text = match (&e, &last_err) {
+                        (ClaudeSdkError::Process { .. }, Some(text)) => {
+                            debug!("Replacing ProcessError with result error text");
+                            ClaudeSdkError::Process {
+                                message: format!(
+                                    "Claude Code returned an error result: {text}"
+                                ),
+                                exit_code: None,
+                                stderr: None,
+                            }
+                        }
+                        _ => {
+                            error!("Fatal reader error: {e}");
+                            e
+                        }
+                    };
                     let mut pending = self.pending.lock().await;
-                    let err_msg = e.to_string();
+                    let err_msg = err_text.to_string();
                     for (_, tx) in pending.drain() {
                         let _ = tx.send(Err(err_msg.clone()));
                     }
-                    let _ = self.msg_tx.send(Err(e));
+                    let _ = self.msg_tx.send(Err(err_text));
                     break;
                 }
             }
+        }
+        // Final flush + close of any attached batcher.
+        let batcher = self.transcript_mirror_batcher.lock().await.clone();
+        if let Some(b) = batcher {
+            b.close().await;
         }
         // Always notify and signal end.
         self.first_result.notify_waiters();
@@ -198,10 +310,20 @@ impl Query {
         let cb = self.can_use_tool.as_ref().ok_or_else(|| "canUseTool callback is not provided".to_string())?;
         let tool_name = req.get("tool_name").and_then(Value::as_str).unwrap_or("").to_string();
         let original_input = req.get("input").cloned().unwrap_or(Value::Null);
+        let suggestions: Vec<PermissionUpdate> = req
+            .get("permission_suggestions")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(PermissionUpdate::from_value).collect())
+            .unwrap_or_default();
         let context = ToolPermissionContext {
-            suggestions: req.get("permission_suggestions").and_then(Value::as_array).cloned().unwrap_or_default(),
+            suggestions,
             tool_use_id: req.get("tool_use_id").and_then(Value::as_str).map(String::from),
             agent_id: req.get("agent_id").and_then(Value::as_str).map(String::from),
+            blocked_path: req.get("blocked_path").and_then(Value::as_str).map(String::from),
+            decision_reason: req.get("decision_reason").and_then(Value::as_str).map(String::from),
+            title: req.get("title").and_then(Value::as_str).map(String::from),
+            display_name: req.get("display_name").and_then(Value::as_str).map(String::from),
+            description: req.get("description").and_then(Value::as_str).map(String::from),
         };
         let result = cb(tool_name, original_input.clone(), context).await;
         match result {
@@ -315,6 +437,14 @@ impl Query {
         }
         if let Some(eds) = self.exclude_dynamic_sections {
             request.insert("excludeDynamicSections".into(), Value::Bool(eds));
+        }
+        // Forward `skills` only when it's an explicit list — `"all"` and
+        // omitted are equivalent at the wire level (no filter).
+        if let Some(SkillsConfig::Only(list)) = &self.skills {
+            request.insert(
+                "skills".into(),
+                Value::Array(list.iter().cloned().map(Value::String).collect()),
+            );
         }
         let response = self
             .send_control_request(Value::Object(request), self.initialize_timeout)
@@ -435,6 +565,13 @@ impl Query {
     /// Take the SDK message receiver. Can only be called once.
     pub async fn take_receiver(&self) -> Option<mpsc::UnboundedReceiver<Result<Value>>> {
         self.msg_rx.lock().await.take()
+    }
+
+    /// Inject a synthetic message into the SDK message stream. Used by the
+    /// transcript-mirror batcher to surface `mirror_error` events as system
+    /// messages without going through the CLI subprocess.
+    pub async fn inject_message(&self, msg: Value) {
+        let _ = self.msg_tx.send(Ok(msg));
     }
 
     /// Spawn a tracked child task.

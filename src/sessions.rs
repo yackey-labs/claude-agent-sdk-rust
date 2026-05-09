@@ -325,8 +325,12 @@ fn parse_session_info_from_lite(
         .rev()
         .find(|ln| ln.starts_with("{\"type\":\"tag\""));
     let tag = tag_line.and_then(|ln| extract_last_json_string_field(ln, "tag"));
+    // created_at from the first ISO timestamp found in the head. Scans the
+    // whole head rather than only first_line because the first record may be
+    // a metadata-only entry (e.g. permission-mode) with no timestamp; the
+    // first user/assistant record that follows does carry one.
     let mut created_at = None;
-    if let Some(ts) = extract_json_string_field(first_line, "timestamp") {
+    if let Some(ts) = extract_json_string_field(head, "timestamp") {
         let normalized = if ts.ends_with('Z') {
             format!("{}+00:00", &ts[..ts.len() - 1])
         } else {
@@ -674,8 +678,27 @@ pub fn get_session_messages(
     if validate_uuid(session_id).is_none() { return Vec::new(); }
     let content = match read_session_file(session_id, directory) { Some(c) => c, None => return Vec::new() };
     let entries = parse_transcript_entries(&content);
-    let chain = build_conversation_chain(&entries);
-    let visible: Vec<SessionMessage> = chain.iter().filter(|e| is_visible(e)).map(to_session_message).collect();
+    entries_to_session_messages(&entries, limit, offset)
+}
+
+/// Build the conversation chain + apply paging. Shared by the filesystem
+/// path and the SessionStore-backed path.
+pub(crate) fn entries_to_session_messages(
+    entries: &[Value],
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<SessionMessage> {
+    let chain = build_conversation_chain(entries);
+    let visible: Vec<SessionMessage> =
+        chain.iter().filter(|e| is_visible(e)).map(to_session_message).collect();
+    apply_message_paging(visible, limit, offset)
+}
+
+fn apply_message_paging(
+    visible: Vec<SessionMessage>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<SessionMessage> {
     let len = visible.len();
     if let Some(l) = limit {
         let end = (offset + l).min(len);
@@ -687,4 +710,428 @@ pub fn get_session_messages(
         return visible[offset..].to_vec();
     }
     visible
+}
+
+// ---------------------------------------------------------------------------
+// list_subagents / get_subagent_messages — subagent transcript reading
+// ---------------------------------------------------------------------------
+
+fn resolve_session_file_path(session_id: &str, directory: Option<&str>) -> Option<PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    let stat_candidate = |project_dir: &Path| -> Option<PathBuf> {
+        let candidate = project_dir.join(&file_name);
+        match std::fs::metadata(&candidate) {
+            Ok(m) if m.len() > 0 => Some(candidate),
+            _ => None,
+        }
+    };
+    if let Some(dir) = directory {
+        let canonical = canonicalize_path(dir);
+        if let Some(pd) = find_project_dir(&canonical) {
+            if let Some(p) = stat_candidate(&pd) {
+                return Some(p);
+            }
+        }
+        for wt in worktree_paths(&canonical) {
+            if wt == canonical { continue; }
+            if let Some(wpd) = find_project_dir(&wt) {
+                if let Some(p) = stat_candidate(&wpd) {
+                    return Some(p);
+                }
+            }
+        }
+        return None;
+    }
+    let pdir = projects_dir();
+    let read = std::fs::read_dir(&pdir).ok()?;
+    for entry in read.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(p) = stat_candidate(&entry.path()) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn resolve_subagents_dir(session_id: &str, directory: Option<&str>) -> Option<PathBuf> {
+    let resolved = resolve_session_file_path(session_id, directory)?;
+    // Strip the .jsonl suffix to derive the session directory.
+    let session_dir = resolved.with_extension("");
+    Some(session_dir.join("subagents"))
+}
+
+fn collect_agent_files(base_dir: &Path) -> Vec<(String, PathBuf)> {
+    fn walk(current: &Path, results: &mut Vec<(String, PathBuf)>) {
+        let mut entries: Vec<_> = match std::fs::read_dir(current) {
+            Ok(r) => r.flatten().collect(),
+            Err(_) => return,
+        };
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let name_str = match name.to_str() { Some(s) => s, None => continue };
+            let ftype = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+            if ftype.is_file()
+                && name_str.starts_with("agent-")
+                && name_str.ends_with(".jsonl")
+            {
+                let agent_id = &name_str["agent-".len()..name_str.len() - ".jsonl".len()];
+                results.push((agent_id.to_string(), entry.path()));
+            } else if ftype.is_dir() {
+                walk(&entry.path(), results);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(base_dir, &mut out);
+    out
+}
+
+fn build_subagent_chain(entries: &[Value]) -> Vec<Value> {
+    if entries.is_empty() { return Vec::new(); }
+    let mut by_uuid: HashMap<String, &Value> = HashMap::new();
+    for e in entries {
+        if let Some(u) = e.get("uuid").and_then(Value::as_str) {
+            by_uuid.insert(u.to_string(), e);
+        }
+    }
+    // Subagent transcripts are linear — last user/assistant entry is the leaf.
+    let leaf = entries.iter().rev().find(|e| {
+        matches!(e.get("type").and_then(Value::as_str), Some("user" | "assistant"))
+    });
+    let leaf = match leaf { Some(l) => l, None => return Vec::new() };
+    let mut chain: Vec<Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cur: Option<Value> = Some(leaf.clone());
+    while let Some(c) = cur.take() {
+        let uid = c.get("uuid").and_then(Value::as_str).unwrap_or("").to_string();
+        if !seen.insert(uid) { break; }
+        let parent = c.get("parentUuid").and_then(Value::as_str).map(String::from);
+        chain.push(c);
+        if let Some(p) = parent {
+            cur = by_uuid.get(&p).map(|v| (*v).clone());
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+/// List subagent IDs for a session by scanning the subagents directory.
+///
+/// Subagent transcripts live at
+/// `~/.claude/projects/<project>/<sessionId>/subagents/agent-<agentId>.jsonl`
+/// (and may be nested in subdirectories such as `workflows/<runId>/`).
+pub fn list_subagents(session_id: &str, directory: Option<&str>) -> Vec<String> {
+    if validate_uuid(session_id).is_none() {
+        return Vec::new();
+    }
+    let dir = match resolve_subagents_dir(session_id, directory) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    collect_agent_files(&dir).into_iter().map(|(id, _)| id).collect()
+}
+
+/// Read a subagent's conversation messages in chronological order.
+pub fn get_subagent_messages(
+    session_id: &str,
+    agent_id: &str,
+    directory: Option<&str>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<SessionMessage> {
+    if validate_uuid(session_id).is_none() || agent_id.is_empty() {
+        return Vec::new();
+    }
+    let subagents_dir = match resolve_subagents_dir(session_id, directory) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let mut matched: Option<PathBuf> = None;
+    for (id, path) in collect_agent_files(&subagents_dir) {
+        if id == agent_id {
+            matched = Some(path);
+            break;
+        }
+    }
+    let path = match matched { Some(p) => p, None => return Vec::new() };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return Vec::new(),
+    };
+    let entries = parse_transcript_entries(&content);
+    entries_to_subagent_messages(&entries, limit, offset)
+}
+
+pub(crate) fn entries_to_subagent_messages(
+    entries: &[Value],
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<SessionMessage> {
+    let chain = build_subagent_chain(entries);
+    let messages: Vec<SessionMessage> = chain
+        .iter()
+        .filter(|e| {
+            matches!(e.get("type").and_then(Value::as_str), Some("user" | "assistant"))
+        })
+        .map(to_session_message)
+        .collect();
+    apply_message_paging(messages, limit, offset)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers shared with the SessionStore-backed variants in `session_store_ops`.
+// ---------------------------------------------------------------------------
+
+/// Derive the [`SessionStore`](crate::types::SessionStore) `project_key` for a directory.
+///
+/// Defaults to the current working directory. Uses the same realpath + NFC
+/// normalization + djb2-hashed sanitization the CLI uses for project
+/// directory names, so keys match between local-disk and store-mirrored
+/// transcripts.
+pub fn project_key_for_directory(directory: Option<&str>) -> String {
+    let abs = canonicalize_path(directory.unwrap_or("."));
+    sanitize_path(&abs)
+}
+
+/// Serialize store entries to a JSONL string. Hoists `type` to the front of
+/// each object so the byte shape matches what the disk path produces (the
+/// lite-parse scans for `{"type":"tag"` as a line prefix).
+pub(crate) fn entries_to_jsonl(entries: &[Value]) -> String {
+    let mut out = String::new();
+    for e in entries {
+        let line = match e {
+            Value::Object(map) if map.contains_key("type") => {
+                let mut reordered = serde_json::Map::with_capacity(map.len());
+                if let Some(t) = map.get("type") {
+                    reordered.insert("type".into(), t.clone());
+                }
+                for (k, v) in map.iter() {
+                    if k != "type" {
+                        reordered.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::to_string(&Value::Object(reordered)).unwrap_or_default()
+            }
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the head/tail/size lite shape from an in-memory JSONL string.
+pub(crate) fn jsonl_to_lite(jsonl: &str, mtime: i64) -> LiteFile {
+    let buf = jsonl.as_bytes();
+    let size = buf.len();
+    let head = String::from_utf8_lossy(&buf[..size.min(LITE_READ_BUF_SIZE)]).into_owned();
+    let tail = if size > LITE_READ_BUF_SIZE {
+        String::from_utf8_lossy(&buf[size - LITE_READ_BUF_SIZE..]).into_owned()
+    } else {
+        head.clone()
+    };
+    LiteFile { mtime, size: size as u64, head, tail }
+}
+
+/// Best-effort mtime: parse the last entry's `timestamp` field. Falls back
+/// to the current wall-clock time when absent or unparseable.
+pub(crate) fn mtime_from_jsonl_tail(jsonl: &str) -> i64 {
+    let trimmed = jsonl.trim_end();
+    let last_line = trimmed.rfind('\n').map(|i| &trimmed[i + 1..]).unwrap_or(trimmed);
+    if let Ok(obj) = serde_json::from_str::<Value>(last_line) {
+        if let Some(ts) = obj.get("timestamp").and_then(Value::as_str) {
+            let normalized = match ts.strip_suffix('Z') {
+                Some(stripped) => format!("{stripped}+00:00"),
+                None => ts.to_string(),
+            };
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
+                return dt.timestamp_millis();
+            }
+        }
+    }
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Filter store-loaded entries to transcript message types with a `uuid`.
+pub(crate) fn filter_transcript_entries(entries: &[Value]) -> Vec<Value> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.is_object()
+                && e.get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| TRANSCRIPT_TYPES.contains(&t))
+                    .unwrap_or(false)
+                && e.get("uuid").and_then(Value::as_str).is_some()
+        })
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// SessionStore-backed reads (async counterparts to list_sessions /
+// get_session_info / get_session_messages / list_subagents /
+// get_subagent_messages).
+// ---------------------------------------------------------------------------
+
+use crate::types::SessionKey;
+
+async fn load_store_entries_as_jsonl(
+    store: &dyn crate::types::SessionStore,
+    session_id: &str,
+    directory: Option<&str>,
+) -> Option<String> {
+    let project_key = project_key_for_directory(directory);
+    let key = SessionKey {
+        project_key,
+        session_id: session_id.to_string(),
+        subpath: String::new(),
+    };
+    let entries = store.load(&key).await.ok().flatten()?;
+    if entries.is_empty() {
+        return None;
+    }
+    Some(entries_to_jsonl(&entries))
+}
+
+/// Read metadata for a single session from a [`SessionStore`](crate::types::SessionStore).
+/// Async counterpart to [`get_session_info`].
+pub async fn get_session_info_from_store(
+    store: &dyn crate::types::SessionStore,
+    session_id: &str,
+    directory: Option<&str>,
+) -> Option<SdkSessionInfo> {
+    validate_uuid(session_id)?;
+    let jsonl = load_store_entries_as_jsonl(store, session_id, directory).await?;
+    let mtime = mtime_from_jsonl_tail(&jsonl);
+    let lite = jsonl_to_lite(&jsonl, mtime);
+    let project_path = canonicalize_path(directory.unwrap_or("."));
+    parse_session_info_from_lite(session_id, &lite, Some(&project_path))
+}
+
+/// Read a session's messages from a [`SessionStore`](crate::types::SessionStore).
+/// Async counterpart to [`get_session_messages`].
+pub async fn get_session_messages_from_store(
+    store: &dyn crate::types::SessionStore,
+    session_id: &str,
+    directory: Option<&str>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<SessionMessage> {
+    if validate_uuid(session_id).is_none() {
+        return Vec::new();
+    }
+    let project_key = project_key_for_directory(directory);
+    let key = SessionKey {
+        project_key,
+        session_id: session_id.into(),
+        subpath: String::new(),
+    };
+    let entries = match store.load(&key).await {
+        Ok(Some(e)) => e,
+        _ => return Vec::new(),
+    };
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let filtered = filter_transcript_entries(&entries);
+    entries_to_session_messages(&filtered, limit, offset)
+}
+
+/// List subagent IDs for a session from a [`SessionStore`](crate::types::SessionStore).
+/// Async counterpart to [`list_subagents`]. Returns an error if the store
+/// does not implement `list_subkeys`.
+pub async fn list_subagents_from_store(
+    store: &dyn crate::types::SessionStore,
+    session_id: &str,
+    directory: Option<&str>,
+) -> crate::errors::Result<Vec<String>> {
+    if validate_uuid(session_id).is_none() {
+        return Ok(Vec::new());
+    }
+    let project_key = project_key_for_directory(directory);
+    let subkeys = store
+        .list_subkeys(&crate::types::SessionListSubkeysKey {
+            project_key,
+            session_id: session_id.into(),
+        })
+        .await?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for sub in subkeys {
+        if !sub.starts_with("subagents/") {
+            continue;
+        }
+        let last = sub.rsplit('/').next().unwrap_or("");
+        if let Some(id) = last.strip_prefix("agent-") {
+            if seen.insert(id.to_string()) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read a subagent's messages from a [`SessionStore`](crate::types::SessionStore).
+/// Async counterpart to [`get_subagent_messages`].
+pub async fn get_subagent_messages_from_store(
+    store: &dyn crate::types::SessionStore,
+    session_id: &str,
+    agent_id: &str,
+    directory: Option<&str>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<SessionMessage> {
+    if validate_uuid(session_id).is_none() || agent_id.is_empty() {
+        return Vec::new();
+    }
+    let project_key = project_key_for_directory(directory);
+
+    // Try list_subkeys first; fall back to the direct path if the store
+    // doesn't implement it.
+    let mut subpath = format!("subagents/agent-{agent_id}");
+    if let Ok(subkeys) = store
+        .list_subkeys(&crate::types::SessionListSubkeysKey {
+            project_key: project_key.clone(),
+            session_id: session_id.into(),
+        })
+        .await
+    {
+        let target = format!("agent-{agent_id}");
+        let matched = subkeys.into_iter().find(|sk| {
+            sk.starts_with("subagents/")
+                && sk.rsplit('/').next().map(|n| n == target).unwrap_or(false)
+        });
+        match matched {
+            Some(s) => subpath = s,
+            None => return Vec::new(),
+        }
+    }
+    let key = SessionKey {
+        project_key,
+        session_id: session_id.into(),
+        subpath,
+    };
+    let entries = match store.load(&key).await {
+        Ok(Some(e)) => e,
+        _ => return Vec::new(),
+    };
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    // Drop synthetic agent_metadata entries injected by the mirror hook.
+    let transcript: Vec<Value> = entries
+        .into_iter()
+        .filter(|e| {
+            !(e.is_object() && e.get("type").and_then(Value::as_str) == Some("agent_metadata"))
+        })
+        .collect();
+    if transcript.is_empty() {
+        return Vec::new();
+    }
+    let filtered = filter_transcript_entries(&transcript);
+    entries_to_subagent_messages(&filtered, limit, offset)
 }

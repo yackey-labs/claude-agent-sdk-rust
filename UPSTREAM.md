@@ -7,12 +7,12 @@ you sync upstream changes (the `/sync-upstream` skill does this automatically).
 
 ```
 upstream_repo: https://github.com/anthropics/claude-agent-sdk-python
-upstream_commit: aaac538e0c2f3a5270cb91e31940630a3d454405
-upstream_short: aaac538
-upstream_subject: chore: bump bundled CLI version to 2.1.110
-upstream_committed: 2026-04-15T22:06:53Z
-synced_at: 2026-04-15
-synced_by: initial port
+upstream_commit: 50058168e34662c52169c919cc20362433a62e38
+upstream_short: 5005816
+upstream_subject: docs: update changelog for v0.1.79
+upstream_committed: 2026-05-09T00:23:16Z
+synced_at: 2026-05-09
+synced_by: claude-code /sync-upstream
 ```
 
 ## How to update

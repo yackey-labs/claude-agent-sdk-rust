@@ -15,12 +15,50 @@ use tracing::{debug, warn};
 use crate::errors::{ClaudeSdkError, Result};
 use crate::transport::Transport;
 use crate::types::{
-    ClaudeAgentOptions, McpServers, SystemPrompt, ThinkingConfig, ToolsConfig,
+    ClaudeAgentOptions, McpServers, SkillsConfig, SystemPrompt, ThinkingConfig, ToolsConfig,
 };
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 1024 * 1024;
+/// Minimum bundled Claude Code CLI version. Synced with the Python SDK's
+/// `_cli_version.py` value (currently `2.1.137`).
 pub const MINIMUM_CLAUDE_CODE_VERSION: &str = "2.0.0";
+pub const BUNDLED_CLI_VERSION: &str = "2.1.137";
 const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Track live CLI subprocess PIDs so we can SIGTERM them on parent process
+// exit. Mirrors the upstream Python `_ACTIVE_CHILDREN` + `atexit` cleanup —
+// prevents orphaned `claude` processes from leaking when callers crash or
+// exit before awaiting close().
+fn active_children() -> &'static std::sync::Mutex<Vec<u32>> {
+    use std::sync::OnceLock;
+    static ACTIVE: OnceLock<std::sync::Mutex<Vec<u32>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| {
+        // Register the at-exit hook on first use (cheap + lazy, so libraries
+        // that never spawn don't pay for it).
+        register_atexit_kill();
+        std::sync::Mutex::new(Vec::new())
+    })
+}
+
+fn register_atexit_kill() {
+    extern "C" fn handler() {
+        if let Ok(mut g) = active_children().lock() {
+            for pid in g.drain(..) {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid;
+                }
+            }
+        }
+    }
+    unsafe {
+        libc::atexit(handler);
+    }
+}
 
 /// Subprocess CLI transport.
 pub struct SubprocessTransport {
@@ -107,6 +145,42 @@ impl SubprocessTransport {
         Ok(Some(serde_json::to_string(&Value::Object(obj))?))
     }
 
+    /// Compute effective allowed_tools and setting_sources, applying
+    /// `skills` defaults. When `options.skills == SkillsConfig::All`, the
+    /// bare `Skill` tool is appended to allowed_tools; for `SkillsConfig::Only`,
+    /// `Skill(name)` is appended for each entry. In either case
+    /// `setting_sources` defaults to `[user, project]` when unset so the CLI
+    /// discovers installed skills without the caller wiring up both options
+    /// manually. `None` is a no-op.
+    fn apply_skills_defaults(&self) -> (Vec<String>, Option<Vec<crate::types::SettingSource>>) {
+        let mut allowed_tools: Vec<String> = self.options.allowed_tools.clone();
+        let mut setting_sources: Option<Vec<crate::types::SettingSource>> =
+            self.options.setting_sources.clone();
+        match &self.options.skills {
+            None => return (allowed_tools, setting_sources),
+            Some(SkillsConfig::All) => {
+                if !allowed_tools.iter().any(|t| t == "Skill") {
+                    allowed_tools.push("Skill".to_string());
+                }
+            }
+            Some(SkillsConfig::Only(names)) => {
+                for name in names {
+                    let pat = format!("Skill({name})");
+                    if !allowed_tools.contains(&pat) {
+                        allowed_tools.push(pat);
+                    }
+                }
+            }
+        }
+        if setting_sources.is_none() {
+            setting_sources = Some(vec![
+                crate::types::SettingSource::User,
+                crate::types::SettingSource::Project,
+            ]);
+        }
+        (allowed_tools, setting_sources)
+    }
+
     fn build_command(&self) -> Result<Vec<String>> {
         let cli = self.cli_path.as_ref().ok_or_else(|| {
             ClaudeSdkError::cli_not_found("CLI path not resolved. Call connect() first.", None)
@@ -152,9 +226,11 @@ impl SubprocessTransport {
             }
         }
 
-        if !self.options.allowed_tools.is_empty() {
+        let (effective_allowed_tools, effective_setting_sources) = self.apply_skills_defaults();
+
+        if !effective_allowed_tools.is_empty() {
             cmd.push("--allowedTools".into());
-            cmd.push(self.options.allowed_tools.join(","));
+            cmd.push(effective_allowed_tools.join(","));
         }
         if let Some(n) = self.options.max_turns {
             cmd.push("--max-turns".into());
@@ -230,17 +306,28 @@ impl SubprocessTransport {
         if self.options.include_partial_messages {
             cmd.push("--include-partial-messages".into());
         }
+        if self.options.include_hook_events {
+            cmd.push("--include-hook-events".into());
+        }
+        if self.options.strict_mcp_config {
+            cmd.push("--strict-mcp-config".into());
+        }
         if self.options.fork_session {
             cmd.push("--fork-session".into());
         }
-        if let Some(ss) = &self.options.setting_sources {
+        if self.options.session_store.is_some() {
+            cmd.push("--session-mirror".into());
+        }
+        if let Some(ss) = &effective_setting_sources {
             let parts: Vec<&str> = ss.iter().map(|s| match s {
                 crate::types::SettingSource::User => "user",
                 crate::types::SettingSource::Project => "project",
                 crate::types::SettingSource::Local => "local",
             }).collect();
-            cmd.push("--setting-sources".into());
-            cmd.push(parts.join(","));
+            // Use `--setting-sources=value` so an empty list still passes
+            // through (`--setting-sources=` disables filesystem settings).
+            // Without `=`, an empty positional value would be dropped.
+            cmd.push(format!("--setting-sources={}", parts.join(",")));
         }
         for plugin in &self.options.plugins {
             match plugin {
@@ -260,19 +347,26 @@ impl SubprocessTransport {
             }
         }
         if let Some(t) = &self.options.thinking {
-            match t {
-                ThinkingConfig::Adaptive => {
+            let display = match t {
+                ThinkingConfig::Adaptive { display } => {
                     cmd.push("--thinking".into());
                     cmd.push("adaptive".into());
+                    *display
                 }
-                ThinkingConfig::Enabled { budget_tokens } => {
+                ThinkingConfig::Enabled { budget_tokens, display } => {
                     cmd.push("--max-thinking-tokens".into());
                     cmd.push(budget_tokens.to_string());
+                    *display
                 }
                 ThinkingConfig::Disabled => {
                     cmd.push("--thinking".into());
                     cmd.push("disabled".into());
+                    None
                 }
+            };
+            if let Some(d) = display {
+                cmd.push("--thinking-display".into());
+                cmd.push(d.as_str().into());
             }
         } else if let Some(n) = self.options.max_thinking_tokens {
             cmd.push("--max-thinking-tokens".into());
@@ -367,8 +461,15 @@ impl Transport for SubprocessTransport {
             command.env("PWD", cwd);
         }
 
-        let pipe_stderr = self.options.stderr.is_some()
-            || self.options.extra_args.contains_key("debug-to-stderr");
+        // Pipe stderr only when the caller registered a callback. The CLI's
+        // `--debug-to-stderr` flag was removed upstream so we no longer
+        // detect it here.
+        //
+        // OTEL trace context (TRACEPARENT/TRACESTATE) is propagated
+        // implicitly via inherited env above — the Rust port doesn't depend
+        // on opentelemetry, so we don't synthesize a fresh carrier the way
+        // the Python SDK does.
+        let pipe_stderr = self.options.stderr.is_some();
 
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
@@ -384,6 +485,12 @@ impl Transport for SubprocessTransport {
                 ClaudeSdkError::cli_connection(format!("Failed to start Claude Code: {e}"))
             }
         })?;
+
+        if let Some(pid) = child.id() {
+            if let Ok(mut g) = active_children().lock() {
+                g.push(pid);
+            }
+        }
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -490,7 +597,14 @@ impl Transport for SubprocessTransport {
             }
             // Reap process
             if let Some(mut ch) = child {
-                if let Ok(status) = ch.wait().await {
+                let pid = ch.id();
+                let status_res = ch.wait().await;
+                if let Some(pid) = pid {
+                    if let Ok(mut g) = active_children().lock() {
+                        g.retain(|p| *p != pid);
+                    }
+                }
+                if let Ok(status) = status_res {
                     if !status.success() {
                         let code = status.code();
                         Err(ClaudeSdkError::process(
@@ -518,12 +632,18 @@ impl Transport for SubprocessTransport {
             handle.abort();
         }
         if let Some(mut child) = self.child.take() {
+            let pid = child.id();
             let timeout = std::time::Duration::from_secs(5);
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(_) => {}
                 Err(_) => {
                     let _ = child.start_kill();
                     let _ = tokio::time::timeout(timeout, child.wait()).await;
+                }
+            }
+            if let Some(pid) = pid {
+                if let Ok(mut g) = active_children().lock() {
+                    g.retain(|p| *p != pid);
                 }
             }
         }

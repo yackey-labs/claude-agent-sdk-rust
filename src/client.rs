@@ -64,12 +64,18 @@ impl ClaudeSdkClient {
             options.permission_prompt_tool_name = Some("stdio".into());
         }
 
+        // Validate session_store-related options early so misconfiguration
+        // fails fast instead of as a confusing mid-session error.
+        crate::session_store_ops::validate_session_store_options(&options)?;
+
         // Clone the bits Query needs before moving options into transport.
         let can_use_tool = options.can_use_tool.clone();
         let hooks = options.hooks.take();
         let agents = options.agents.clone();
         let sdk_mcp_servers = extract_sdk_mcp_servers(&options.mcp_servers);
         let exclude_dynamic_sections = preset_exclude_dynamic(&options.system_prompt);
+        let skills = options.skills.clone();
+        let session_store = options.session_store.clone();
 
         let transport: Box<dyn Transport> = match self.custom_transport.take() {
             Some(t) => t,
@@ -80,7 +86,7 @@ impl ClaudeSdkClient {
         let mut transport = transport;
         transport.connect().await?;
 
-        let q = Arc::new(Query::new(
+        let mut query = Query::new(
             transport,
             true,
             can_use_tool,
@@ -89,7 +95,57 @@ impl ClaudeSdkClient {
             initialize_timeout,
             agents,
             exclude_dynamic_sections,
-        ));
+        );
+        query.set_skills(skills);
+        let q = Arc::new(query);
+
+        // Wire SessionStore mirror batcher (if configured).
+        if let Some(store) = session_store {
+            let projects_dir = crate::sessions::projects_dir()
+                .to_string_lossy()
+                .to_string();
+            let q_for_err = Arc::downgrade(&q);
+            let on_error: crate::session_store_ops::OnMirrorError = std::sync::Arc::new(
+                move |key: Option<crate::types::SessionKey>, err: String| {
+                    let q_weak = q_for_err.clone();
+                    Box::pin(async move {
+                        if let Some(q) = q_weak.upgrade() {
+                            // Synthesize a `mirror_error` system message into
+                            // the consumer stream.
+                            let session_id = key
+                                .as_ref()
+                                .map(|k| k.session_id.clone())
+                                .unwrap_or_default();
+                            let mut msg = serde_json::Map::new();
+                            msg.insert("type".into(), Value::String("system".into()));
+                            msg.insert("subtype".into(), Value::String("mirror_error".into()));
+                            msg.insert("error".into(), Value::String(err));
+                            if let Some(k) = key {
+                                msg.insert(
+                                    "key".into(),
+                                    serde_json::to_value(&k).unwrap_or(Value::Null),
+                                );
+                            }
+                            msg.insert(
+                                "uuid".into(),
+                                Value::String(uuid::Uuid::new_v4().to_string()),
+                            );
+                            msg.insert("session_id".into(), Value::String(session_id));
+                            q.inject_message(Value::Object(msg)).await;
+                        }
+                    }) as futures::future::BoxFuture<'static, ()>
+                },
+            );
+            let batcher = std::sync::Arc::new(
+                crate::session_store_ops::TranscriptMirrorBatcher::new(
+                    store,
+                    projects_dir,
+                    on_error,
+                ),
+            );
+            q.set_transcript_mirror_batcher(batcher).await;
+        }
+
         q.start().await?;
         q.initialize().await?;
 

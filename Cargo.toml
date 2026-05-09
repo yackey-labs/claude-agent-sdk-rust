@@ -1,6 +1,6 @@
 [package]
 name = "claude-agent-sdk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Rust SDK for Claude Code (Claude Agent SDK)"
@@ -33,13 +33,13 @@ uuid = { version = "1", features = ["v4"] }
 unicode-normalization = "0.1"
 rand = "0.9"
 async-stream = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full", "test-util", "macros"] }
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-libc = "0.2"
 
 [[example]]
 name = "quickstart"

@@ -20,6 +20,35 @@ pub fn parse_message(data: &Value) -> Result<Option<Message>> {
         ClaudeSdkError::message_parse("Message missing 'type' field", Some(data.clone()))
     })?;
 
+    // Hook events (emitted when ``include_hook_events`` is enabled) arrive as
+    // ``system`` messages with ``subtype`` of ``hook_started`` or
+    // ``hook_response``. Surface them as a SystemMessage with `hook_event`
+    // populated rather than a separate variant.
+    if msg_type == "system" {
+        if let Some(sub) = obj.get("subtype").and_then(Value::as_str) {
+            if sub == "hook_started" || sub == "hook_response" {
+                let hook_event_name = obj
+                    .get("hook_event")
+                    .and_then(Value::as_str)
+                    .or_else(|| obj.get("hook_name").and_then(Value::as_str))
+                    .or_else(|| obj.get("hook_event_name").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(Some(Message::System(SystemMessage {
+                    subtype: sub.to_string(),
+                    data: data.clone(),
+                    task: None,
+                    hook_event: Some(HookEventInfo {
+                        hook_event_name,
+                        session_id: obj.get("session_id").and_then(Value::as_str).map(String::from),
+                        uuid: obj.get("uuid").and_then(Value::as_str).map(String::from),
+                    }),
+                    mirror_error: None,
+                })));
+            }
+        }
+    }
+
     match msg_type {
         "user" => parse_user(data).map(Some),
         "assistant" => parse_assistant(data).map(Some),
@@ -80,6 +109,25 @@ fn parse_blocks(blocks_val: &Value, data: &Value) -> Result<Vec<ContentBlock>> {
                     .to_string(),
                 content: b.get("content").cloned(),
                 is_error: b.get("is_error").and_then(Value::as_bool),
+            }),
+            "server_tool_use" => {
+                let name_raw = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let name: ServerToolName = serde_json::from_value(Value::String(name_raw.clone()))
+                    .unwrap_or(ServerToolName::Other);
+                ContentBlock::ServerToolUse(ServerToolUseBlock {
+                    id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    name,
+                    name_raw,
+                    input: b.get("input").cloned().unwrap_or(Value::Null),
+                })
+            }
+            "advisor_tool_result" => ContentBlock::ServerToolResult(ServerToolResultBlock {
+                tool_use_id: b
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                content: b.get("content").cloned().unwrap_or(Value::Null),
             }),
             _ => continue,
         };
@@ -148,6 +196,7 @@ fn str_field(v: &Value, k: &str, data: &Value) -> Result<String> {
 
 fn parse_system(data: &Value) -> Result<Message> {
     let subtype = str_field(data, "subtype", data)?;
+    let mut mirror_error: Option<MirrorErrorInfo> = None;
     let task = match subtype.as_str() {
         "task_started" => Some(TaskMessage::Started {
             task_id: str_field(data, "task_id", data)?,
@@ -194,12 +243,37 @@ fn parse_system(data: &Value) -> Result<Message> {
                 usage,
             })
         }
+        "mirror_error" => {
+            // SDK-synthesized via report_mirror_error — never emitted by the
+            // CLI subprocess.
+            let key = data
+                .get("key")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<SessionKey>(v).ok());
+            mirror_error = Some(MirrorErrorInfo {
+                key,
+                error: data.get("error").and_then(Value::as_str).unwrap_or("").to_string(),
+            });
+            None
+        }
         _ => None,
     };
-    Ok(Message::System(SystemMessage { subtype, data: data.clone(), task }))
+    Ok(Message::System(SystemMessage {
+        subtype,
+        data: data.clone(),
+        task,
+        hook_event: None,
+        mirror_error,
+    }))
 }
 
 fn parse_result(data: &Value) -> Result<Message> {
+    let deferred_tool_use = data.get("deferred_tool_use").and_then(|d| {
+        let id = d.get("id").and_then(Value::as_str)?.to_string();
+        let name = d.get("name").and_then(Value::as_str)?.to_string();
+        let input = d.get("input").cloned().unwrap_or(Value::Null);
+        Some(DeferredToolUse { id, name, input })
+    });
     Ok(Message::Result(ResultMessage {
         subtype: str_field(data, "subtype", data)?,
         duration_ms: data.get("duration_ms").and_then(Value::as_u64).ok_or_else(|| missing("duration_ms", data))?,
@@ -217,10 +291,12 @@ fn parse_result(data: &Value) -> Result<Message> {
             .get("permission_denials")
             .and_then(Value::as_array)
             .cloned(),
+        deferred_tool_use,
         errors: data
             .get("errors")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+        api_error_status: data.get("api_error_status").and_then(Value::as_i64),
         uuid: data.get("uuid").and_then(Value::as_str).map(String::from),
     }))
 }

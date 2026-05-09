@@ -373,3 +373,313 @@ fn unicode_category(c: char) -> UnicodeCategory {
         0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
     ).then_some(UnicodeCategory::Cf).unwrap_or(UnicodeCategory::Other)
 }
+
+// ---------------------------------------------------------------------------
+// SessionStore-backed mutations (rename / tag / delete / fork)
+// ---------------------------------------------------------------------------
+
+use crate::sessions::project_key_for_directory;
+use crate::types::{SessionKey, SessionStore};
+
+fn iso_now() -> String {
+    // RFC 3339 with millisecond precision and trailing Z, matching the
+    // Python `datetime.now(UTC).isoformat().replace("+00:00", "Z")`.
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Rename a session by appending a `custom-title` entry to a `SessionStore`.
+pub async fn rename_session_via_store(
+    store: &dyn SessionStore,
+    session_id: &str,
+    title: &str,
+    directory: Option<&str>,
+) -> Result<()> {
+    if validate_uuid(session_id).is_none() {
+        return Err(ClaudeSdkError::InvalidArgument(format!(
+            "Invalid session_id: {session_id}"
+        )));
+    }
+    let stripped = title.trim();
+    if stripped.is_empty() {
+        return Err(ClaudeSdkError::InvalidArgument("title must be non-empty".into()));
+    }
+    let key = SessionKey {
+        project_key: project_key_for_directory(directory),
+        session_id: session_id.into(),
+        subpath: String::new(),
+    };
+    let entry = json!({
+        "type": "custom-title",
+        "customTitle": stripped,
+        "sessionId": session_id,
+        "uuid": Uuid::new_v4().to_string(),
+        "timestamp": iso_now(),
+    });
+    store.append(&key, std::slice::from_ref(&entry)).await
+}
+
+/// Tag a session by appending a `tag` entry to a `SessionStore`. Pass
+/// `None` to clear the tag.
+pub async fn tag_session_via_store(
+    store: &dyn SessionStore,
+    session_id: &str,
+    tag: Option<&str>,
+    directory: Option<&str>,
+) -> Result<()> {
+    if validate_uuid(session_id).is_none() {
+        return Err(ClaudeSdkError::InvalidArgument(format!(
+            "Invalid session_id: {session_id}"
+        )));
+    }
+    let final_tag = match tag {
+        None => String::new(),
+        Some(t) => {
+            let s = sanitize_unicode(t).trim().to_string();
+            if s.is_empty() {
+                return Err(ClaudeSdkError::InvalidArgument(
+                    "tag must be non-empty (use None to clear)".into(),
+                ));
+            }
+            s
+        }
+    };
+    let key = SessionKey {
+        project_key: project_key_for_directory(directory),
+        session_id: session_id.into(),
+        subpath: String::new(),
+    };
+    let entry = json!({
+        "type": "tag",
+        "tag": final_tag,
+        "sessionId": session_id,
+        "uuid": Uuid::new_v4().to_string(),
+        "timestamp": iso_now(),
+    });
+    store.append(&key, std::slice::from_ref(&entry)).await
+}
+
+/// Delete a session from a `SessionStore`. If the store does not implement
+/// `delete`, this is a no-op (appropriate for WORM/append-only backends).
+pub async fn delete_session_via_store(
+    store: &dyn SessionStore,
+    session_id: &str,
+    directory: Option<&str>,
+) -> Result<()> {
+    if validate_uuid(session_id).is_none() {
+        return Err(ClaudeSdkError::InvalidArgument(format!(
+            "Invalid session_id: {session_id}"
+        )));
+    }
+    let key = SessionKey {
+        project_key: project_key_for_directory(directory),
+        session_id: session_id.into(),
+        subpath: String::new(),
+    };
+    match store.delete(&key).await {
+        Ok(()) => Ok(()),
+        Err(ClaudeSdkError::NotImplemented(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Fork a session in a `SessionStore` into a new branch with fresh UUIDs.
+pub async fn fork_session_via_store(
+    store: &dyn SessionStore,
+    session_id: &str,
+    directory: Option<&str>,
+    up_to_message_id: Option<&str>,
+    title: Option<&str>,
+) -> Result<ForkSessionResult> {
+    if validate_uuid(session_id).is_none() {
+        return Err(ClaudeSdkError::InvalidArgument(format!(
+            "Invalid session_id: {session_id}"
+        )));
+    }
+    if let Some(m) = up_to_message_id {
+        if validate_uuid(m).is_none() {
+            return Err(ClaudeSdkError::InvalidArgument(format!(
+                "Invalid up_to_message_id: {m}"
+            )));
+        }
+    }
+    let project_key = project_key_for_directory(directory);
+    let src_key = SessionKey {
+        project_key: project_key.clone(),
+        session_id: session_id.into(),
+        subpath: String::new(),
+    };
+    let loaded = store.load(&src_key).await?;
+    let loaded = loaded.ok_or_else(|| {
+        ClaudeSdkError::FileNotFound(format!("Session {session_id} not found"))
+    })?;
+
+    // Partition into transcript entries (with uuid) and content-replacements.
+    let mut transcript: Vec<Value> = Vec::new();
+    let mut content_replacements: Vec<Value> = Vec::new();
+    for entry in &loaded {
+        if !entry.is_object() {
+            continue;
+        }
+        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
+        if TRANSCRIPT_TYPES.contains(&entry_type)
+            && entry.get("uuid").and_then(Value::as_str).is_some()
+        {
+            transcript.push(entry.clone());
+        } else if entry_type == "content-replacement"
+            && entry.get("sessionId").and_then(Value::as_str) == Some(session_id)
+        {
+            if let Some(arr) = entry.get("replacements").and_then(Value::as_array) {
+                content_replacements.extend(arr.iter().cloned());
+            }
+        }
+    }
+
+    // Filter sidechains.
+    let mut transcript: Vec<Value> = transcript
+        .into_iter()
+        .filter(|e| !e.get("isSidechain").and_then(Value::as_bool).unwrap_or(false))
+        .collect();
+    if transcript.is_empty() {
+        return Err(ClaudeSdkError::InvalidArgument(format!(
+            "Session {session_id} has no messages to fork"
+        )));
+    }
+    if let Some(cutoff_id) = up_to_message_id {
+        let cutoff = transcript
+            .iter()
+            .position(|e| e.get("uuid").and_then(Value::as_str) == Some(cutoff_id))
+            .ok_or_else(|| {
+                ClaudeSdkError::InvalidArgument(format!(
+                    "Message {cutoff_id} not found in session {session_id}"
+                ))
+            })?;
+        transcript.truncate(cutoff + 1);
+    }
+
+    let mut uuid_mapping: HashMap<String, String> = HashMap::new();
+    for entry in &transcript {
+        let old = entry.get("uuid").and_then(Value::as_str).unwrap_or("").to_string();
+        uuid_mapping.insert(old, Uuid::new_v4().to_string());
+    }
+    let writable: Vec<&Value> = transcript
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) != Some("progress"))
+        .collect();
+    if writable.is_empty() {
+        return Err(ClaudeSdkError::InvalidArgument(format!(
+            "Session {session_id} has no messages to fork"
+        )));
+    }
+    let by_uuid: HashMap<&str, &Value> = transcript
+        .iter()
+        .map(|e| (e.get("uuid").and_then(Value::as_str).unwrap_or(""), e))
+        .collect();
+    let forked_session_id = Uuid::new_v4().to_string();
+    let now = iso_now();
+    let mut emitted: Vec<Value> = Vec::new();
+    let writable_len = writable.len();
+    for (i, original) in writable.iter().enumerate() {
+        let new_uuid = uuid_mapping
+            .get(original.get("uuid").and_then(Value::as_str).unwrap_or(""))
+            .cloned()
+            .unwrap();
+        let mut new_parent: Option<String> = None;
+        let mut parent_id = original.get("parentUuid").and_then(Value::as_str).map(String::from);
+        while let Some(pid) = parent_id.clone() {
+            let parent = match by_uuid.get(pid.as_str()) {
+                Some(p) => *p,
+                None => break,
+            };
+            if parent.get("type").and_then(Value::as_str) != Some("progress") {
+                new_parent = uuid_mapping.get(&pid).cloned();
+                break;
+            }
+            parent_id = parent.get("parentUuid").and_then(Value::as_str).map(String::from);
+        }
+        let timestamp = if i == writable_len - 1 {
+            now.clone()
+        } else {
+            original.get("timestamp").and_then(Value::as_str).unwrap_or(&now).to_string()
+        };
+        let logical_parent = original.get("logicalParentUuid").and_then(Value::as_str).map(String::from);
+        let new_logical_parent = logical_parent
+            .as_ref()
+            .map(|lp| uuid_mapping.get(lp).cloned().unwrap_or_else(|| lp.clone()));
+        let mut forked = original.as_object().cloned().unwrap_or_default();
+        forked.insert("uuid".into(), Value::String(new_uuid));
+        forked.insert("parentUuid".into(), new_parent.map(Value::String).unwrap_or(Value::Null));
+        forked.insert(
+            "logicalParentUuid".into(),
+            new_logical_parent.map(Value::String).unwrap_or(Value::Null),
+        );
+        forked.insert("sessionId".into(), Value::String(forked_session_id.clone()));
+        forked.insert("timestamp".into(), Value::String(timestamp));
+        forked.insert("isSidechain".into(), Value::Bool(false));
+        forked.insert(
+            "forkedFrom".into(),
+            json!({
+                "sessionId": session_id,
+                "messageUuid": original.get("uuid").and_then(Value::as_str).unwrap_or(""),
+            }),
+        );
+        for k in ["teamName", "agentName", "slug", "sourceToolAssistantUUID"] {
+            forked.remove(k);
+        }
+        emitted.push(Value::Object(forked));
+    }
+    if !content_replacements.is_empty() {
+        emitted.push(json!({
+            "type": "content-replacement",
+            "sessionId": forked_session_id,
+            "replacements": content_replacements,
+            "uuid": Uuid::new_v4().to_string(),
+            "timestamp": now,
+        }));
+    }
+    // Derive title.
+    let fork_title = match title.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => format!("{t} (fork)"),
+        None => {
+            let mut custom: Option<String> = None;
+            let mut ai: Option<String> = None;
+            for e in &loaded {
+                if let Some(ct) = e.get("customTitle").and_then(Value::as_str) {
+                    if !ct.is_empty() {
+                        custom = Some(ct.to_string());
+                    }
+                }
+                if let Some(at) = e.get("aiTitle").and_then(Value::as_str) {
+                    if !at.is_empty() {
+                        ai = Some(at.to_string());
+                    }
+                }
+            }
+            let base = custom
+                .or(ai)
+                .or_else(|| {
+                    // First-prompt fallback: serialize entries to JSONL and
+                    // reuse the head extractor.
+                    let jsonl = crate::sessions::entries_to_jsonl(&loaded);
+                    let fp = extract_first_prompt_from_head(&jsonl);
+                    if fp.is_empty() { None } else { Some(fp) }
+                })
+                .unwrap_or_else(|| "Forked session".into());
+            format!("{base} (fork)")
+        }
+    };
+    emitted.push(json!({
+        "type": "custom-title",
+        "sessionId": forked_session_id,
+        "customTitle": fork_title,
+        "uuid": Uuid::new_v4().to_string(),
+        "timestamp": now,
+    }));
+
+    let dst_key = SessionKey {
+        project_key,
+        session_id: forked_session_id.clone(),
+        subpath: String::new(),
+    };
+    store.append(&dst_key, &emitted).await?;
+    Ok(ForkSessionResult { session_id: forked_session_id })
+}
