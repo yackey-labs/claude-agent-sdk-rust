@@ -1085,6 +1085,23 @@ pub enum SkillsConfig {
 // Sandbox network config (passthrough JSON also works via `SandboxSettings`)
 // ---------------------------------------------------------------------------
 
+/// Violations to ignore in sandbox.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxIgnoreViolations {
+    /// File paths for which violations should be ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<Vec<String>>,
+    /// Network hosts for which violations should be ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<Vec<String>>,
+}
+
+/// Type alias for the synthetic system message emitted when a
+/// [`SessionStore::append`] call fails after retries. Exposed by name so
+/// callers writing `match msg.subtype.as_str() { "mirror_error" => ... }`
+/// have a single canonical reference.
+pub type MirrorErrorMessage = MirrorErrorInfo;
+
 /// Network configuration for sandbox.
 ///
 /// Mirrors the upstream `SandboxNetworkConfig` TypedDict. All fields are

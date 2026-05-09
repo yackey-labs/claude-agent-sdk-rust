@@ -23,6 +23,10 @@ pub struct ClaudeSdkClient {
     custom_transport: Option<Box<dyn Transport>>,
     query: Mutex<Option<Arc<Query>>>,
     rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Result<Value>>>>>,
+    /// Held alive for the duration of the connection so its Drop impl
+    /// removes the materialized temp config dir on disconnect/teardown.
+    /// `None` when no SessionStore-backed resume happened.
+    _materialized_resume: Mutex<Option<crate::session_store_ops::MaterializedResume>>,
 }
 
 impl ClaudeSdkClient {
@@ -32,6 +36,7 @@ impl ClaudeSdkClient {
             custom_transport: None,
             query: Mutex::new(None),
             rx: Arc::new(Mutex::new(None)),
+            _materialized_resume: Mutex::new(None),
         }
     }
 
@@ -41,6 +46,7 @@ impl ClaudeSdkClient {
             custom_transport: Some(transport),
             query: Mutex::new(None),
             rx: Arc::new(Mutex::new(None)),
+            _materialized_resume: Mutex::new(None),
         }
     }
 
@@ -68,6 +74,14 @@ impl ClaudeSdkClient {
         // fails fast instead of as a confusing mid-session error.
         crate::session_store_ops::validate_session_store_options(&options)?;
 
+        // Materialize SessionStore-backed resume into a temp CLAUDE_CONFIG_DIR.
+        let materialized =
+            crate::session_store_ops::materialize_resume_session(&options).await?;
+        if let Some(m) = &materialized {
+            crate::session_store_ops::apply_materialized_options(&mut options, m);
+        }
+        *self._materialized_resume.lock().await = materialized;
+
         // Clone the bits Query needs before moving options into transport.
         let can_use_tool = options.can_use_tool.clone();
         let hooks = options.hooks.take();
@@ -76,6 +90,7 @@ impl ClaudeSdkClient {
         let exclude_dynamic_sections = preset_exclude_dynamic(&options.system_prompt);
         let skills = options.skills.clone();
         let session_store = options.session_store.clone();
+        let session_store_flush = options.session_store_flush;
 
         let transport: Box<dyn Transport> = match self.custom_transport.take() {
             Some(t) => t,
@@ -141,7 +156,8 @@ impl ClaudeSdkClient {
                     store,
                     projects_dir,
                     on_error,
-                ),
+                )
+                .with_flush_mode(session_store_flush),
             );
             q.set_transcript_mirror_batcher(batcher).await;
         }

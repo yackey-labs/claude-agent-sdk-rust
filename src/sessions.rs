@@ -997,6 +997,147 @@ async fn load_store_entries_as_jsonl(
     Some(entries_to_jsonl(&entries))
 }
 
+/// List sessions from a [`SessionStore`](crate::types::SessionStore).
+///
+/// Async counterpart to [`list_sessions`]. If the store implements
+/// `list_session_summaries`, this is one batch call plus one cheap
+/// `list_sessions()` enumeration to gap-fill sessions missing or with a
+/// stale sidecar — zero per-session `load()` calls when sidecars are
+/// fresh. Otherwise falls back to one `store.load()` per session.
+///
+/// Returns an error if the store implements neither
+/// `list_session_summaries` nor `list_sessions`.
+pub async fn list_sessions_from_store(
+    store: &dyn crate::types::SessionStore,
+    directory: Option<&str>,
+    limit: Option<usize>,
+    offset: usize,
+) -> crate::errors::Result<Vec<SdkSessionInfo>> {
+    let project_path = canonicalize_path(directory.unwrap_or("."));
+    let project_key = sanitize_path(&project_path);
+
+    // Probe both methods; classify NotImplemented as "absent".
+    let summaries_result = store.list_session_summaries(&project_key).await;
+    let listing_result = store.list_sessions(&project_key).await;
+    let has_summaries = !matches!(
+        summaries_result,
+        Err(crate::errors::ClaudeSdkError::NotImplemented(_))
+    );
+    let has_listing = !matches!(
+        listing_result,
+        Err(crate::errors::ClaudeSdkError::NotImplemented(_))
+    );
+
+    // Fast path: store maintains incremental summaries.
+    if has_summaries {
+        let summaries = summaries_result?;
+        let listing: Vec<crate::types::SessionStoreListEntry> = if has_listing {
+            listing_result.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let known_mtimes: HashMap<String, i64> = listing
+            .iter()
+            .map(|e| (e.session_id.clone(), e.mtime))
+            .collect();
+
+        struct Slot {
+            mtime: i64,
+            session_id: String,
+            info: Option<SdkSessionInfo>,
+        }
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut fresh_summary_ids: HashSet<String> = HashSet::new();
+        for s in &summaries {
+            if has_listing {
+                let known = match known_mtimes.get(&s.session_id) {
+                    Some(m) => *m,
+                    None => continue, // summary for a now-removed session — drop
+                };
+                if s.mtime < known {
+                    // Stale sidecar — let gap-fill re-fold from source.
+                    continue;
+                }
+            }
+            let info = crate::session_store_ops::summary_entry_to_sdk_info(
+                s,
+                Some(&project_path),
+            );
+            fresh_summary_ids.insert(s.session_id.clone());
+            if let Some(info) = info {
+                slots.push(Slot {
+                    mtime: s.mtime,
+                    session_id: s.session_id.clone(),
+                    info: Some(info),
+                });
+            }
+        }
+        if has_listing {
+            for e in &listing {
+                if !fresh_summary_ids.contains(&e.session_id) {
+                    slots.push(Slot {
+                        mtime: e.mtime,
+                        session_id: e.session_id.clone(),
+                        info: None,
+                    });
+                }
+            }
+        }
+        slots.sort_by_key(|s| std::cmp::Reverse(s.mtime));
+        let mut page: Vec<Slot> = if offset > 0 && offset < slots.len() {
+            slots.split_off(offset)
+        } else if offset >= slots.len() {
+            Vec::new()
+        } else {
+            slots
+        };
+        if let Some(l) = limit {
+            page.truncate(l);
+        }
+        // Gap-fill placeholders.
+        for slot in page.iter_mut() {
+            if slot.info.is_none() {
+                if let Some(jsonl) =
+                    load_store_entries_as_jsonl(store, &slot.session_id, directory).await
+                {
+                    let lite = jsonl_to_lite(&jsonl, slot.mtime);
+                    if let Some(mut info) =
+                        parse_session_info_from_lite(&slot.session_id, &lite, Some(&project_path))
+                    {
+                        info.last_modified = slot.mtime;
+                        slot.info = Some(info);
+                    }
+                }
+            }
+        }
+        return Ok(page.into_iter().filter_map(|s| s.info).collect());
+    }
+
+    if !has_listing {
+        return Err(crate::errors::ClaudeSdkError::NotImplemented(
+            "list_sessions",
+        ));
+    }
+    let listing = listing_result.unwrap_or_default();
+    // Slow path: load each session individually to derive a real summary.
+    let mut results = Vec::new();
+    for entry in &listing {
+        let jsonl = match load_store_entries_as_jsonl(store, &entry.session_id, directory).await
+        {
+            Some(j) => j,
+            None => continue,
+        };
+        let lite = jsonl_to_lite(&jsonl, entry.mtime);
+        if let Some(mut info) =
+            parse_session_info_from_lite(&entry.session_id, &lite, Some(&project_path))
+        {
+            info.last_modified = entry.mtime;
+            results.push(info);
+        }
+    }
+    Ok(apply_sort_limit(results, limit, offset))
+}
+
 /// Read metadata for a single session from a [`SessionStore`](crate::types::SessionStore).
 /// Async counterpart to [`get_session_info`].
 pub async fn get_session_info_from_store(

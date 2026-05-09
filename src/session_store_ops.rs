@@ -24,7 +24,7 @@ use tracing::{debug, error, warn};
 use crate::errors::{ClaudeSdkError, Result};
 use crate::types::{
     ClaudeAgentOptions, SdkSessionInfo, SessionKey, SessionListSubkeysKey, SessionStore,
-    SessionStoreEntry, SessionStoreListEntry, SessionSummaryEntry,
+    SessionStoreEntry, SessionStoreFlushMode, SessionStoreListEntry, SessionSummaryEntry,
 };
 
 // ---------------------------------------------------------------------------
@@ -386,10 +386,13 @@ struct BatcherState {
 /// Accumulates `transcript_mirror` frames and flushes them to a
 /// [`SessionStore`].
 ///
-/// `enqueue` is fire-and-forget; `flush` is async. The pending queue is
-/// bounded — when it exceeds [`MAX_PENDING_ENTRIES`] or [`MAX_PENDING_BYTES`]
-/// an eager flush fires in the background so memory stays flat during long
-/// turns where no `result` (and thus no explicit `flush()`) arrives.
+/// `enqueue` is fire-and-forget; `flush` is async. In `Batched` flush mode
+/// the pending queue is bounded — when it exceeds [`MAX_PENDING_ENTRIES`] or
+/// [`MAX_PENDING_BYTES`] an eager flush fires in the background so memory
+/// stays flat during long turns where no `result` (and thus no explicit
+/// `flush()`) arrives. In `Eager` flush mode every `enqueue` triggers a
+/// background drain immediately so adapters see entries in near real time;
+/// drains are still serialized via the flush lock so append ordering holds.
 pub struct TranscriptMirrorBatcher {
     store: Arc<dyn SessionStore>,
     projects_dir: String,
@@ -397,6 +400,7 @@ pub struct TranscriptMirrorBatcher {
     send_timeout: Duration,
     max_pending_entries: usize,
     max_pending_bytes: usize,
+    flush_mode: SessionStoreFlushMode,
     state: Arc<Mutex<BatcherState>>,
     flush_lock: Arc<Mutex<()>>,
 }
@@ -414,6 +418,7 @@ impl TranscriptMirrorBatcher {
             send_timeout: Duration::from_secs(SEND_TIMEOUT_SECONDS),
             max_pending_entries: MAX_PENDING_ENTRIES,
             max_pending_bytes: MAX_PENDING_BYTES,
+            flush_mode: SessionStoreFlushMode::Batched,
             state: Arc::new(Mutex::new(BatcherState {
                 pending: Vec::new(),
                 pending_entries: 0,
@@ -428,7 +433,16 @@ impl TranscriptMirrorBatcher {
         self
     }
 
-    /// Buffer a frame; schedule an eager flush if thresholds are exceeded.
+    /// Configure the flush mode. [`SessionStoreFlushMode::Eager`] triggers a
+    /// background drain after every `enqueue`; [`SessionStoreFlushMode::Batched`]
+    /// (default) only drains on threshold or explicit `flush`.
+    pub fn with_flush_mode(mut self, mode: SessionStoreFlushMode) -> Self {
+        self.flush_mode = mode;
+        self
+    }
+
+    /// Buffer a frame; in `Eager` mode trigger a background flush
+    /// immediately, otherwise only when thresholds are exceeded.
     pub async fn enqueue(self: &Arc<Self>, file_path: String, entries: Vec<SessionStoreEntry>) {
         // Approximate wire size — one stringify per frame keeps it cheap.
         let bytes = serde_json::to_string(&entries).map(|s| s.len()).unwrap_or(0);
@@ -436,9 +450,13 @@ impl TranscriptMirrorBatcher {
         s.pending_entries += entries.len();
         s.pending_bytes += bytes;
         s.pending.push(MirrorEntry { file_path, entries, bytes });
-        let trigger =
-            s.pending_entries > self.max_pending_entries || s.pending_bytes > self.max_pending_bytes;
+        let over_threshold = s.pending_entries > self.max_pending_entries
+            || s.pending_bytes > self.max_pending_bytes;
         drop(s);
+        let trigger = match self.flush_mode {
+            SessionStoreFlushMode::Eager => true,
+            SessionStoreFlushMode::Batched => over_threshold,
+        };
         if trigger {
             let me = self.clone();
             tokio::spawn(async move {
@@ -825,4 +843,259 @@ fn walk_jsonl(root: &Path) -> Vec<(PathBuf, String)> {
     }
     walk(root, &mut out);
     out
+}
+
+// ---------------------------------------------------------------------------
+// Resume materialization
+// ---------------------------------------------------------------------------
+
+/// Result of [`materialize_resume_session`]. Drop calls `cleanup` on the
+/// temporary config dir; alternatively call [`MaterializedResume::cleanup`]
+/// explicitly.
+pub struct MaterializedResume {
+    /// Temporary directory laid out like `~/.claude/`. Point the subprocess
+    /// at it via `CLAUDE_CONFIG_DIR`.
+    pub config_dir: PathBuf,
+    /// Session ID to pass as `--resume`. When the input was
+    /// `continue_conversation`, this is the most-recent session resolved
+    /// via [`SessionStore::list_sessions`].
+    pub resume_session_id: String,
+    /// Whether the temp dir is still owned by this struct. Set to `false`
+    /// after `cleanup` runs.
+    owned: bool,
+}
+
+impl MaterializedResume {
+    /// Best-effort recursive removal of the temp config dir. Idempotent.
+    pub fn cleanup(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_dir_all(&self.config_dir);
+            self.owned = false;
+        }
+    }
+}
+
+impl Drop for MaterializedResume {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Load a session from `options.session_store` and write it to a temp dir.
+///
+/// Returns `None` when no materialization is needed (no store, no
+/// resume/continue, store has no entries, or the resolved session ID is not
+/// a valid UUID). For `continue_conversation` this means a fresh session;
+/// for an explicit `resume` value the CLI receives it unchanged.
+///
+/// Note: unlike the Python SDK, this Rust port does **not** copy auth
+/// credentials into the temp dir. Callers that rely on file-based auth
+/// (`~/.claude/.credentials.json`) under `CLAUDE_CONFIG_DIR` should set
+/// `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` in `options.env`
+/// instead. API-key auth Just Works.
+pub async fn materialize_resume_session(
+    options: &ClaudeAgentOptions,
+) -> Result<Option<MaterializedResume>> {
+    let store = match options.session_store.as_ref() {
+        Some(s) => s.clone(),
+        None => return Ok(None),
+    };
+    if options.resume.is_none() && !options.continue_conversation {
+        return Ok(None);
+    }
+    let timeout = std::time::Duration::from_millis(options.load_timeout_ms.unwrap_or(60_000));
+    let project_key = crate::sessions::project_key_for_directory(
+        options.cwd.as_ref().and_then(|p| p.to_str()),
+    );
+
+    let resolved = if let Some(resume_id) = options.resume.as_deref() {
+        // session_id is used as a path component; reject non-UUIDs to
+        // prevent traversal.
+        if !is_uuid(resume_id) {
+            return Ok(None);
+        }
+        load_with_timeout(&*store, &project_key, resume_id, timeout)
+            .await?
+            .map(|entries| (resume_id.to_string(), entries))
+    } else {
+        resolve_continue_candidate(&*store, &project_key, timeout).await?
+    };
+    let (session_id, entries) = match resolved {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let tmp_base = tempfile::Builder::new()
+        .prefix("claude-resume-")
+        .tempdir()
+        .map_err(ClaudeSdkError::Io)?
+        .keep();
+    let tmp_base_clone = tmp_base.clone();
+    let result: Result<()> = (|| {
+        let project_dir = tmp_base_clone.join("projects").join(&project_key);
+        std::fs::create_dir_all(&project_dir)?;
+        write_jsonl(&project_dir.join(format!("{session_id}.jsonl")), &entries)?;
+        Ok::<(), ClaudeSdkError>(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&tmp_base);
+        return Err(e);
+    }
+
+    // Materialize subagent transcripts if the store enumerates them.
+    let project_dir = tmp_base.join("projects").join(&project_key);
+    let subkeys_res = tokio::time::timeout(
+        timeout,
+        store.list_subkeys(&SessionListSubkeysKey {
+            project_key: project_key.clone(),
+            session_id: session_id.clone(),
+        }),
+    )
+    .await;
+    if let Ok(Ok(subkeys)) = subkeys_res {
+        for sub in subkeys {
+            let key = SessionKey {
+                project_key: project_key.clone(),
+                session_id: session_id.clone(),
+                subpath: sub.clone(),
+            };
+            let entries = match tokio::time::timeout(timeout, store.load(&key)).await {
+                Ok(Ok(Some(e))) => e,
+                _ => continue,
+            };
+            // Path: <project_dir>/<session_id>/<subpath>.jsonl
+            let target = project_dir.join(&session_id).join(format!("{sub}.jsonl"));
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = write_jsonl(&target, &entries);
+        }
+    }
+
+    Ok(Some(MaterializedResume {
+        config_dir: tmp_base,
+        resume_session_id: session_id,
+        owned: true,
+    }))
+}
+
+fn is_uuid(s: &str) -> bool {
+    use std::sync::OnceLock;
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    let re = R.get_or_init(|| {
+        regex::Regex::new(
+            r"^(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        .unwrap()
+    });
+    re.is_match(s)
+}
+
+async fn load_with_timeout(
+    store: &dyn SessionStore,
+    project_key: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<Option<Vec<SessionStoreEntry>>> {
+    let key = SessionKey {
+        project_key: project_key.into(),
+        session_id: session_id.into(),
+        subpath: String::new(),
+    };
+    match tokio::time::timeout(timeout, store.load(&key)).await {
+        Ok(Ok(opt)) => Ok(opt),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(ClaudeSdkError::SessionStoreTimeout(format!(
+            "load({session_id}) exceeded {}ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+async fn resolve_continue_candidate(
+    store: &dyn SessionStore,
+    project_key: &str,
+    timeout: Duration,
+) -> Result<Option<(String, Vec<SessionStoreEntry>)>> {
+    let listing = match tokio::time::timeout(timeout, store.list_sessions(project_key)).await {
+        Ok(Ok(l)) => l,
+        Ok(Err(ClaudeSdkError::NotImplemented(_))) => return Ok(None),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(ClaudeSdkError::SessionStoreTimeout(format!(
+                "list_sessions({project_key}) exceeded {}ms",
+                timeout.as_millis()
+            )))
+        }
+    };
+    if listing.is_empty() {
+        return Ok(None);
+    }
+    let mut best: Option<&SessionStoreListEntry> = None;
+    for e in &listing {
+        match best {
+            None => best = Some(e),
+            Some(cur) if e.mtime > cur.mtime => best = Some(e),
+            _ => {}
+        }
+    }
+    let candidate = best.unwrap();
+    match load_with_timeout(store, project_key, &candidate.session_id, timeout).await? {
+        Some(entries) => Ok(Some((candidate.session_id.clone(), entries))),
+        None => Ok(None),
+    }
+}
+
+fn write_jsonl(path: &Path, entries: &[SessionStoreEntry]) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    for entry in entries {
+        // Hoist `type` to the front so the disk-layout byte shape matches
+        // what the disk path produces (the lite-parse scans for
+        // `{"type":"tag"` as a line prefix).
+        let serialized = if let Value::Object(map) = entry {
+            if map.contains_key("type") {
+                let mut reordered = serde_json::Map::with_capacity(map.len());
+                if let Some(t) = map.get("type") {
+                    reordered.insert("type".into(), t.clone());
+                }
+                for (k, v) in map.iter() {
+                    if k != "type" {
+                        reordered.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::to_string(&Value::Object(reordered))?
+            } else {
+                serde_json::to_string(entry)?
+            }
+        } else {
+            serde_json::to_string(entry)?
+        };
+        f.write_all(serialized.as_bytes())?;
+        f.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Apply a [`MaterializedResume`] to options: rewrite `env` with
+/// `CLAUDE_CONFIG_DIR`, set `resume`, clear `continue_conversation`.
+///
+/// The caller is responsible for keeping the [`MaterializedResume`] alive
+/// for the duration of the subprocess (its `Drop` impl removes the temp
+/// dir). Typically this means storing it on the client/options struct
+/// alongside the spawned process.
+pub fn apply_materialized_options(
+    options: &mut ClaudeAgentOptions,
+    materialized: &MaterializedResume,
+) {
+    options.env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        materialized.config_dir.to_string_lossy().into_owned(),
+    );
+    options.resume = Some(materialized.resume_session_id.clone());
+    options.continue_conversation = false;
 }

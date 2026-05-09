@@ -58,8 +58,8 @@ pub use mcp::{create_sdk_mcp_server, McpToolAnnotations, SdkMcpServer, SdkMcpToo
 pub use sessions::{
     get_session_info, get_session_info_from_store, get_session_messages,
     get_session_messages_from_store, get_subagent_messages,
-    get_subagent_messages_from_store, list_sessions, list_subagents,
-    list_subagents_from_store, project_key_for_directory,
+    get_subagent_messages_from_store, list_sessions, list_sessions_from_store,
+    list_subagents, list_subagents_from_store, project_key_for_directory,
 };
 pub use session_mutations::{
     delete_session, delete_session_via_store, fork_session, fork_session_via_store,
@@ -67,8 +67,9 @@ pub use session_mutations::{
     ForkSessionResult,
 };
 pub use session_store_ops::{
-    file_path_to_session_key, fold_session_summary, import_session_to_store,
-    summary_entry_to_sdk_info, validate_session_store_options, InMemorySessionStore,
+    apply_materialized_options, file_path_to_session_key, fold_session_summary,
+    import_session_to_store, materialize_resume_session, summary_entry_to_sdk_info,
+    validate_session_store_options, InMemorySessionStore, MaterializedResume,
     OnMirrorError, TranscriptMirrorBatcher, MAX_PENDING_BYTES, MAX_PENDING_ENTRIES,
 };
 pub use transport::Transport;
@@ -111,6 +112,18 @@ pub async fn query_with_transport(
 
     session_store_ops::validate_session_store_options(&options)?;
 
+    // If a SessionStore is paired with resume / continue_conversation,
+    // materialize the session JSONL into a temp CLAUDE_CONFIG_DIR and
+    // repoint options before subprocess spawn. The MaterializedResume is
+    // kept alive for the lifetime of the stream so its Drop cleans up.
+    let _materialized = match session_store_ops::materialize_resume_session(&options).await? {
+        Some(m) => {
+            session_store_ops::apply_materialized_options(&mut options, &m);
+            Some(m)
+        }
+        None => None,
+    };
+
     let can_use_tool = options.can_use_tool.clone();
     let hooks = options.hooks.take();
     let agents = options.agents.clone();
@@ -118,6 +131,7 @@ pub async fn query_with_transport(
     let exclude_dynamic_sections = client::preset_exclude_dynamic(&options.system_prompt);
     let skills = options.skills.clone();
     let session_store = options.session_store.clone();
+    let session_store_flush = options.session_store_flush;
 
     let transport: Box<dyn Transport> = match transport {
         Some(t) => t,
@@ -173,11 +187,10 @@ pub async fn query_with_transport(
                 }) as futures::future::BoxFuture<'static, ()>
             },
         );
-        let batcher = Arc::new(session_store_ops::TranscriptMirrorBatcher::new(
-            store,
-            projects_dir,
-            on_error,
-        ));
+        let batcher = Arc::new(
+            session_store_ops::TranscriptMirrorBatcher::new(store, projects_dir, on_error)
+                .with_flush_mode(session_store_flush),
+        );
         q.set_transcript_mirror_batcher(batcher).await;
     }
 
@@ -208,6 +221,9 @@ pub async fn query_with_transport(
         .await
         .ok_or_else(|| ClaudeSdkError::cli_connection("Receiver already taken"))?;
     let q_for_drop = q.clone();
+    // Move the materialized temp dir into the stream closure so the temp
+    // dir lives until the stream is dropped (its Drop impl removes the dir).
+    let materialized = _materialized;
 
     let stream = async_stream::try_stream! {
         let mut rx = rx;
@@ -224,6 +240,7 @@ pub async fn query_with_transport(
             }
         }
         let _ = q_for_drop.close().await;
+        drop(materialized);
     };
 
     Ok(Box::pin(stream))
